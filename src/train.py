@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 #----------------------------------------------------------------------------
-# Author        Jonathon Gibbs
-# Email         pszjg@nottingham.ac.uk
-# Website       https://www.jonathongibbs.com
-# Github        https://github.com/DrJonoG/
-# StomataHub    https://www.stomatahub.com
+# Author            Jonathon Gibbs
+# Acknowledgements  Based on original work on Pytorch
+# Email             pszjg@nottingham.ac.uk
+# Website           https://www.jonathongibbs.com
+# Github            https://github.com/DrJonoG/
+# StomataHub        https://www.stomatahub.com
 #----------------------------------------------------------------------------
 
 # Import comet before other packages
@@ -12,6 +13,7 @@ from comet_ml import Experiment, init
 from comet_ml.integration.pytorch import log_model, watch
 
 import os
+import copy
 import json
 import torch
 import random
@@ -30,8 +32,52 @@ import torchvision.utils as vutils
 import matplotlib.pyplot as plt
 
 from models import Generator, Discriminator
-from utils.helpers import dotdict, printer, printer_config
+from utils.helpers import dotdict, printer, printer_config, print_progress_bar
 from argparse import ArgumentParser
+
+#----------------------------------------------------------------------------
+
+def calculate_gradient_penalty (
+    model, 
+    real_images, 
+    fake_images, 
+    device
+):
+    """Calculates the gradient penalty loss for WGAN GP"""
+    # Random weight term for interpolation between real and fake data
+    alpha = torch.randn((real_images.size(0), 1, 1, 1), device=device)
+    # Get random interpolation between real and fake data
+    interpolates = (alpha * real_images + ((1 - alpha) * fake_images)).requires_grad_(True)
+
+    model_interpolates = model(interpolates)
+    grad_outputs = torch.ones(model_interpolates.size(), device=device, requires_grad=False)
+
+    # Get gradient w.r.t. interpolates
+    gradients = torch.autograd.grad(
+        outputs=model_interpolates,
+        inputs=interpolates,
+        grad_outputs=grad_outputs,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = torch.mean((gradients.norm(2, dim=1) - 1) ** 2)
+    return gradient_penalty
+
+#----------------------------------------------------------------------------
+
+def get_real_labels(batch_size, device):
+    #labels = np.random.uniform(0.7, 1.0, size=(batch_size,))
+    return torch.full((batch_size,), 1.0, dtype=torch.float, device=device)   
+    #return torch.from_numpy(labels).float().to(device)
+
+#----------------------------------------------------------------------------
+
+def get_fake_labels(batch_size, device):
+    #labels = np.random.uniform(0.0, 0.3, size=(batch_size,))
+    return torch.full((batch_size,), 0.0, dtype=torch.float, device=device)    
+    #return torch.from_numpy(labels).float().to(device)
 
 #----------------------------------------------------------------------------
 
@@ -55,12 +101,18 @@ def run (
     dis: type[dotdict], 
     experiment: object
 ):
+    #----------------------------------------------------------------------------
+    ## Dataset intialisation
+    #----------------------------------------------------------------------------
 
-    # Generate folders
     folder = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     train.savepath = os.path.join(train.savepath, folder)
 
     experiment.set_name(folder)
+
+    # Log implementation of model
+    experiment.log_code(file_name='./src/models/discriminator.py')
+    experiment.log_code(file_name='./src/models/generator.py')
 
     if not os.path.exists(train.savepath):
         os.mkdir(train.savepath)
@@ -84,7 +136,7 @@ def run (
             transforms.Resize((train.resize[0], train.resize[1])),
             transforms.CenterCrop((train.resize[0], train.resize[1])),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.GaussianBlur(kernel_size=(5)),
+            #transforms.GaussianBlur(kernel_size=(5)),
             transforms.RandomAdjustSharpness(sharpness_factor=2),
             transforms.ToTensor(),
             transforms.Normalize((0.5,), (0.5,)),
@@ -107,22 +159,24 @@ def run (
 
     # Plot some training images
     printer("Plotting training images")
+
     real_batch = next(iter(dataloader))
-    plt.figure(figsize=(8,8))
-    plt.axis("off")
-    plt.title("Training Images")
-    plt.imshow(np.transpose(vutils.make_grid(real_batch[0].to(device)[:(8*8)], padding=2, normalize=True).cpu(),(1,2,0)))
-    plt.gcf().set_size_inches(10, 5)
-    plt.savefig(os.path.join(train.savepath,'real_images.png'), dpi=200)
+    real_grid = vutils.make_grid(real_batch[0].to(device)[:64], padding=2, normalize=True)
+    real_grid = transforms.ToPILImage()(real_grid) 
 
-    printer(f"Saving training images to {os.path.join(train.savepath,'real_images.png')}")
+    experiment.log_image(real_grid, name="Real images")
     
-    experiment.log_image(os.path.join(train.savepath,'real_images.png'), name="real_images")
 
-
-    #----------- Model generation -----------------------------------------------
+    #----------------------------------------------------------------------------
+    ## Model intialisation 
+    #----------------------------------------------------------------------------
 
     netG = Generator(train.gen_input, train.gen_features, train.channels).to(device)
+
+    printer(f"Generator model saved to {os.path.join(train.savepath,'netG_architecture.pt')}")
+    #netG_script = torch.jit.script(netG) # Export to TorchScript
+    #netG_script.save(os.path.join(train.savepath,'netG_architecture.pt')) # Save
+    experiment.log_model('netG', os.path.join(train.savepath,'netG_architecture.pt'))
 
     # Handle multi-GPU if desired
     if (device.type == 'cuda') and (len(train.gpus) > 1):
@@ -133,15 +187,15 @@ def run (
     netG.apply(weights_init)
     
     if train.debug:
-        print(netG)
-
-    printer(f"Generator model saved to {os.path.join(train.savepath,'netG_architecture.pt')}")
-    netG_script = torch.jit.script(netG) # Export to TorchScript
-    netG_script.save(os.path.join(train.savepath,'netG_architecture.pt')) # Save
-    experiment.log_model('netG', os.path.join(train.savepath,'netG_architecture.pt'))
-
+        print(netG)    
+ 
     # Create the Discriminator
     netD = Discriminator(train.dis_features, train.channels).to(device)
+
+    printer(f"Discriminator model saved to {os.path.join(train.savepath,'netD_architecture.pt')}")
+    #netD_script = torch.jit.script(netD) # Export to TorchScript
+    #netD_script.save(os.path.join(train.savepath,'netD_architecture.pt')) # Save
+    experiment.log_model('netD', os.path.join(train.savepath,'netD_architecture.pt'))
 
     # Handle multi-GPU if desired
     if (device.type == 'cuda') and (len(train.gpus) > 1):
@@ -152,37 +206,31 @@ def run (
     netD.apply(weights_init)
 
     if train.debug:
-        print(netD)
+        print(netD)  
 
-    printer(f"Discriminator model saved to {os.path.join(train.savepath,'netD_architecture.pt')}")
-    netD_script = torch.jit.script(netD) # Export to TorchScript
-    netD_script.save(os.path.join(train.savepath,'netD_architecture.pt')) # Save
-    experiment.log_model('netD', os.path.join(train.savepath,'netD_architecture.pt'))
-
+    #----------------------------------------------------------------------------
+    ## Loss and Optimizer initialisation
     #----------------------------------------------------------------------------
 
     # Initialize the ``BCELoss`` function
-    criterion = nn.BCELoss()
+    criterionD = nn.BCELoss()
+    criterionG = nn.BCELoss()
 
     # Create batch of latent vectors that we will use to visualize
     #  the progression of the generator
     fixed_noise = torch.randn(64, train.gen_input, 1, 1, device=device)
 
-    # Establish convention for real and fake labels during training
-    real_label = 1.
-    fake_label = 0.
-
     if dis.optimizer == "Adam":
         optimizerD = optim.Adam(netD.parameters(), lr=dis.lr, betas=(dis.beta1, 0.999)) # should use SGD
+    elif dis.optimizer == "SGD":
+        optimizerD = optim.SGD(netD.parameters(), lr=dis.lr, momentum=0.9)
 
     if gen.optimizer == "Adam":
         optimizerG = optim.Adam(netG.parameters(), lr=gen.lr, betas=(gen.beta1, 0.999))
 
-    #optimizerD = optim.SGD(netD.parameters(), lr=lr, momentum=0.9)
-
 
     #----------------------------------------------------------------------------
-    # Training Loop
+    ## Training Loop
     #----------------------------------------------------------------------------
     with experiment.train():
 
@@ -190,135 +238,206 @@ def run (
         watch(netD)
 
         step = 0
+        totalSteps = train.epochs * len(dataloader)
+        top_k = train.batch
+        min_k = int(train.batch * 0.3)
 
-        # Lists to keep track of progress
-        G_losses = []
-        D_losses = []
+        # Variables for saving models
+        dis_lowest_loss = float("inf")
+        gen_lowest_loss = float("inf")
+        D_G_z2_highest = 0
 
         printer("Starting Training Loop...")
         # For each epoch
         for epoch in range(train.epochs):
-            experiment.log_current_epoch(epoch)
+
+            # Store for plotting
+            epoch_G_losses = []
+            epoch_D_losses = []
+            epoch_D_G_z1 = []
+            epoch_D_G_z2 = []
+            epoch_D_x = []
+            epoch_grad_penalty = []
+
+            
+
             # For each batch in the dataloader
             for i, data in enumerate(dataloader, 0):
-                #--------------------------------------------------------------------
-                # (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
-                #--------------------------------------------------------------------
 
-                ## Train with all-real batch
                 netD.zero_grad()
+                netG.zero_grad()
+                optimizerD.zero_grad()
+                optimizerG.zero_grad()
+
+
+                #--------------------------------------------------------------------
+                ## (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
+                #--------------------------------------------------------------------
+
+                ## 1.a --------- Train with all-real batch
                 # Format batch
-                real_cpu = data[0].to(device)
-                b_size = real_cpu.size(0)
-                label = torch.full((b_size,), real_label, dtype=torch.float, device=device)
+                real_images = data[0].to(device)
+                batch_size = real_images.size(0)
 
+                # Adjust the top elements to select
+                if epoch > train.warmup_epochs:
+                    top_k = batch_size - epoch
+                    if top_k < min_k:
+                        top_k = min_k
+                        
+                # Adjust qunatity to be filtered in Generator training
+                if top_k > batch_size: top_k = batch_size 
                 # Forward pass real batch through D
-                output = netD(real_cpu).view(-1)
+                real_output = netD(real_images).view(-1)
+                real_labels = get_real_labels(batch_size, device)
                 # Calculate loss on all-real batch
-                errD_real = criterion(output, label)
+                loss_D_real = criterionD(real_output, real_labels)
                 # Calculate gradients for D in backward pass
-                errD_real.backward()
-                D_x = output.mean().item()
+                loss_D_real.backward()
+                D_x = real_output.mean().item()
 
-                ## Train with all-fake batch
+                ## 1.b --------- Train with all-fake batch
                 # Generate batch of latent vectors
-                noise = torch.randn(b_size, train.gen_input, 1, 1, device=device)
+                noise = torch.randn(batch_size, train.gen_input, 1, 1, device=device)
                 # Generate fake image batch with G
-                fake = netG(noise)
-                label.fill_(fake_label)
-                # Classify all fake batch with D
-                output = netD(fake.detach()).view(-1)
+                fake_images = netG(noise)            
+                # Classify all fake batch with D and Get labels
+                fake_output = netD(fake_images.detach()).view(-1)                
+                fake_output, _ = torch.topk(fake_output, top_k)
+                fake_labels = get_fake_labels(top_k, device)
                 # Calculate D's loss on the all-fake batch
-                errD_fake = criterion(output, label)
-                # Calculate the gradients for this batch, accumulated (summed) with previous gradients
-                errD_fake.backward()
-                D_G_z1 = output.mean().item()
-                # Compute error of D as sum over the fake and the real batches
-                errD = errD_real + errD_fake
+                loss_D_fake = criterionD(fake_output, fake_labels)
+                # Calculate the gradients for this batch,
+                loss_D_fake.backward()                
+                D_G_z1 = fake_output.mean().item()
                 # Update D
                 optimizerD.step()
+                #Compute error of D as sum over the fake and the real batches
+                loss_D = loss_D_real + loss_D_fake        
+
+                # Adversarial loss
+                adversarial_loss = 0 #-D_x + D_G_z1 + lambda_gp * gradient_penalty    
+
                 
                 #--------------------------------------------------------------------
-                # (2) Update G network: maximize log(D(G(z)))           
-                #--------------------------------------------------------------------
-                netG.zero_grad()
-                label.fill_(real_label)  # fake labels are real for generator cost
+                ## (2) Update G network: maximize log(D(G(z)))           
+                #--------------------------------------------------------------------                
                 # Since we just updated D, perform another forward pass of all-fake batch through D
-                output = netD(fake).view(-1)
+                output = netD(fake_images).view(-1)
+                output, _ = torch.topk(output, top_k)
+                labels = get_real_labels(top_k, device)
                 # Calculate G's loss based on this output
-                errG = criterion(output, label)
+                loss_G = criterionG(output, labels)
                 # Calculate gradients for G
-                errG.backward()
+                loss_G.backward()
                 D_G_z2 = output.mean().item()
                 # Update G
                 optimizerG.step()
 
-                # Output training stats
-                if i % 50 == 0:
-                    printer('[%d/%d][%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z)): %.4f / %.4f'
-                          % (epoch, train.epochs, i, len(dataloader),
-                             errD.item(), errG.item(), D_x, D_G_z1, D_G_z2), end="\r")
-      
-                # Save Losses for plotting later
-                G_losses.append(errG.item())
-                D_losses.append(errD.item())
+                #--------------------------------------------------------------------
+                ## (3) Output training stats:
+                #--------------------------------------------------------------------
 
-                experiment.log_metric("errG", errG.item(), step=step)
-                experiment.log_metric("errD", errD.item(), step=step)
+                print_progress_bar(
+                        i+1, 
+                        len(dataloader), 
+                        prefix = f"Epoch {epoch+1} of {train.epochs}. Progress:", 
+                        suffix = f"Complete. Loss_D: {loss_D.item():.4f}, Loss_G: {loss_G.item():.4f}, D(x): {D_x:.4f}, D(G(z)): {D_G_z1:.4f} / {D_G_z2:.4f}, Adversarial Loss: {adversarial_loss:.4f}",
+                        decimals = 1,
+                        length = 30,
+                )
 
-                experiment.log_metric("D_x", D_x, step=step)
-                experiment.log_metric("D_G_z1", D_G_z1, step=step)
-                experiment.log_metric("D_G_z2", D_G_z2, step=step)
+                # Save epoch results for averagers
+                epoch_G_losses.append(loss_G.item())
+                epoch_D_losses.append(loss_D.item())
+                epoch_D_G_z1.append(D_G_z1)
+                epoch_D_G_z2.append(D_G_z2)
+                epoch_D_x.append(D_x)
+                epoch_grad_penalty.append(adversarial_loss)
+
+                # Log
+                step_logger = {
+                    "Gen_Loss": loss_G.item(),
+                    "Dis_Loss": loss_D.item(),
+                    "D_G_z1": D_G_z1,
+                    "D_G_z2": D_G_z2,
+                    "Avg. Output": D_x,
+                    "Adversarial_Loss": adversarial_loss
+                }
+                experiment.log_metrics(step_logger, step=step)
 
                 step += 1
 
 
+            #------------------------------------------------------------------------
+            ## Log data (end of epoch)
+            #------------------------------------------------------------------------
+
+            epoch_G_losses = np.average(epoch_G_losses)
+            epoch_D_losses = np.average(epoch_D_losses)
+            epoch_D_G_z1 = np.average(epoch_D_G_z1)
+            epoch_D_G_z2 = np.average(epoch_D_G_z2)
+            epoch_D_x = np.average(epoch_D_x)
+            epoch_grad_penalty = np.average(epoch_grad_penalty)
+
+            epoch_logger = {
+                "Epoch_Gen_Loss": epoch_G_losses, 
+                "Epoch_Dis_Loss": epoch_D_losses,
+                "Epoch_D_G_z1": epoch_D_G_z1, 
+                "Epoch_D_G_z2": epoch_D_G_z2,
+                "Epoch_D_x": epoch_D_x,
+                "Epoch_grad_penalty": epoch_grad_penalty
+            }
+
+            experiment.log_metrics(epoch_logger, epoch=epoch)
+
+            # Output training stats
+            print_progress_bar(
+                    len(dataloader), 
+                    len(dataloader), 
+                    prefix = f"Epoch {epoch+1} of {train.epochs}. Progress:", 
+                    suffix = f"Complete. Loss_D: {epoch_D_losses:.4f}, Loss_G: {epoch_G_losses:.4f}, D(x): {epoch_D_x:.4f}, D(G(z)): {epoch_D_G_z1:.4f} / {epoch_D_G_z2:.4f}",
+                    decimals = 1,
+                    length = 30,
+                    end = "\r\n"
+            )
+
             # Generate fake image and save grid
             fake = netG(fixed_noise).detach().cpu()
             fake_grid = vutils.make_grid(fake, padding=2, normalize=True)
+            fake_grid = transforms.ToPILImage()(fake_grid) 
+            
+            experiment.log_image(fake_grid, name=f"{str(epoch).zfill(8)}")
 
-            vutils.save_image(fake_grid, os.path.join(train.epochpath, f"fake_epoch_{epoch}.jpg"))            
-            experiment.log_image(os.path.join(train.epochpath, f"fake_epoch_{epoch}.jpg"), name=f"fake_epoch_{epoch}")
+            # Save current state for resumption
+            try:
+                # Save state to allow resumption if failure
+                gen_state = {
+                    'epoch': epoch,
+                    'state_dict': netG.state_dict(),
+                    'optimizer': optimizerG.state_dict(),
+                }
+                #with open(os.path.join(train.savepath, 'gen_checkpoint.t7'), 'wb') as f:
+                #    torch.save(gen_state, f)
 
-            # Save state to allow resumption if failure
-            gen_state = {
-                'epoch': epoch,
-                'state_dict': netG.module.state_dict(),
-                'optimizer': optimizerG.state_dict(),
-            }
+                dis_state = {
+                    'epoch': epoch,
+                    'state_dict': netD.state_dict(),
+                    'optimizer': optimizerD.state_dict(),
+                }
 
-            torch.save(gen_state,os.path.join(train.savepath, 'gen_checkpoint.t7'))
-            experiment.log_model(experiment, gen_state, model_name="gen_checkpoint")
-
-            dis_state = {
-                'epoch': epoch,
-                'state_dict': netD.module.state_dict(),
-                'optimizer': optimizerD.state_dict(),
-            }
-
-            torch.save(dis_state,os.path.join(train.savepath, 'dis_checkpoint.t7'))
-            experiment.log_model(experiment, dis_state, model_name="dis_checkpoint")
+                #with open(os.path.join(train.savepath, 'dis_checkpoint.t7'), 'wb') as f:
+                #    torch.save(dis_state, f)
+            except Exception as e:
+                printer(f"Error {str(e)}")
 
     #----------------------------------------------------------------------------
-    # End Training Loop
+    ## End of Training Loop
     #----------------------------------------------------------------------------
 
     # Save final models
-    torch.save(netG, os.path.join(train.savepath, 'netg_final.pth'))
-    torch.save(netD, os.path.join(train.savepath, 'netd_final.pth'))
-
-    # Training loss
-    plt.figure(figsize=(10,5))
-    plt.title("Generator and Discriminator Loss During Training")
-    plt.plot(G_losses,label="G")
-    plt.plot(D_losses,label="D")
-    plt.xlabel("iterations")
-    plt.ylabel("Loss")
-    plt.legend()
-
-    fig = plt.figure(figsize=(8,8))
-    plt.axis("off")
-    plt.savefig(os.path.join(train.savepath,'training_loss.png'), dpi=200)
+    torch.save(netG.state_dict(), os.path.join(train.savepath, 'netg_final.pth'))
+    torch.save(netD.state_dict(), os.path.join(train.savepath, 'netd_final.pth'))
 
     experiment.end()
 

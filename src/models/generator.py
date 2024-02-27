@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 #----------------------------------------------------------------------------
-# Author        Jonathon Gibbs
-# Email         pszjg@nottingham.ac.uk
-# Website       https://www.jonathongibbs.com
-# Github        https://github.com/DrJonoG/
-# StomataHub    https://www.stomatahub.com
+# Author            Jonathon Gibbs
+# Acknowledgements  Based on original work on Pytorch
+# Email             pszjg@nottingham.ac.uk
+# Website           https://www.jonathongibbs.com
+# Github            https://github.com/DrJonoG/
+# StomataHub        https://www.stomatahub.com
 #----------------------------------------------------------------------------
 
 import torch.nn as nn
@@ -23,33 +24,33 @@ class Generator(nn.Module):
 
         self.main = nn.Sequential(
             # input is Z, going into a convolution
-            nn.ConvTranspose2d(gen_input, gen_features * 32, 4, 1, 0, bias=False),
-            nn.BatchNorm2d(gen_features * 32),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (gen_features*32) x 4 x 4
-            nn.ConvTranspose2d(gen_features * 32, gen_features * 16, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(gen_features * 16),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (gen_features*16) x 4 x 4
-            nn.ConvTranspose2d(gen_features * 16, gen_features * 8, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(gen_features * 8),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (gen_features*8) x 8 x 8
-            nn.ConvTranspose2d(gen_features * 8, gen_features * 4, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(gen_features * 4),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (gen_features*4) x 16 x 16
-            nn.ConvTranspose2d(gen_features * 4, gen_features * 2, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(gen_features * 2),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (gen_features*2) x 32 x 32
-            nn.ConvTranspose2d(gen_features * 2,     gen_features, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(gen_features),
-            nn.LeakyReLU(0.2, inplace=True),
-            # state size. (gen_features) x 64 x 64
+            self._block(gen_input, gen_features * 32, 4, 1, 0, bias=False),
+            self._block(gen_features * 32, gen_features * 16, 4, 2, 1, bias=False),
+            self._block(gen_features * 16, gen_features * 8, 4, 2, 1, bias=False),
+            self._block(gen_features * 8, gen_features * 4, 4, 2, 1, bias=False),
+            self._block(gen_features * 4, gen_features * 2, 4, 2, 1, bias=False),
+            self._block(gen_features * 2,     gen_features, 4, 2, 1, bias=False),
+            
             nn.ConvTranspose2d(    gen_features,      channels, 4, 2, 1, bias=False),
             nn.Tanh()
             # state size. (nc) x 128 x 128
+        )
+
+
+
+    def _block (
+        self, 
+        in_channels, 
+        out_channels, 
+        kernel_size, 
+        stride, 
+        padding,
+        bias=False
+    ):
+        return nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.LeakyReLU(0.2, inplace=True)
         )
 
     def forward(self, input):

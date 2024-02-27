@@ -163,3 +163,8 @@ training/*
 src/data/*
 
 comet.json
+
+docs/*
+results/*
+data/*
+paper/*

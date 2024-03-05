@@ -13,6 +13,7 @@ from comet_ml import Experiment, init
 from comet_ml.integration.pytorch import log_model, watch
 
 import os
+import math
 import copy
 import json
 import torch
@@ -29,10 +30,17 @@ import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
 
+
+
 import matplotlib.pyplot as plt
 
-from models import Generator, Discriminator
+from models import Generator_, Discriminator
 from utils.helpers import dotdict, printer, printer_config, print_progress_bar
+
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.inception import InceptionScore
+from torchmetrics.image.kid import KernelInceptionDistance
+
 from argparse import ArgumentParser
 
 #----------------------------------------------------------------------------
@@ -68,16 +76,28 @@ def calculate_gradient_penalty (
 #----------------------------------------------------------------------------
 
 def get_real_labels(batch_size, device):
-    #labels = np.random.uniform(0.7, 1.0, size=(batch_size,))
-    return torch.full((batch_size,), 1.0, dtype=torch.float, device=device)   
-    #return torch.from_numpy(labels).float().to(device)
+    labels = np.random.uniform(0.8, 1.0, size=(batch_size,))
+    #return torch.full((batch_size,), 1.0, dtype=torch.float, device=device)   
+    return torch.from_numpy(labels).float().to(device)
 
 #----------------------------------------------------------------------------
 
 def get_fake_labels(batch_size, device):
-    #labels = np.random.uniform(0.0, 0.3, size=(batch_size,))
-    return torch.full((batch_size,), 0.0, dtype=torch.float, device=device)    
-    #return torch.from_numpy(labels).float().to(device)
+    labels = np.random.uniform(0.0, 0.2, size=(batch_size,))
+    #return torch.full((batch_size,), 0.0, dtype=torch.float, device=device)    
+    return torch.from_numpy(labels).float().to(device)
+
+
+#----------------------------------------------------------------------------
+
+def get_top_k(output, temperature, batch_size, warmup):
+    if warmup:
+        return batch_size
+    else:
+        mean = torch.mean(output)
+        base_batch_size = batch_size * temperature
+        top_k = base_batch_size + (mean * (batch_size - base_batch_size))
+        return int(math.ceil(top_k))
 
 #----------------------------------------------------------------------------
 
@@ -93,182 +113,308 @@ def weights_init(m):
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0)
 
+
+class Train:
+    def __init__(
+        self,
+        train: type[dotdict], 
+        gen: type[dotdict], 
+        dis: type[dotdict], 
+        general: type[dotdict],
+        experiment: object
+    ) -> None:
+        #----------------------------------------------------------------------------
+        ## Dataset intialisation
+        #----------------------------------------------------------------------------
+
+        folder = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        train.savepath = os.path.join(train.savepath, folder)
+
+        if not os.path.exists(train.savepath):
+            os.mkdir(train.savepath)
+
+        train.epochpath = os.path.join(train.savepath, "epochs")
+        if not os.path.exists(train.epochpath):
+            os.mkdir(train.epochpath)
+                
+        printer(f"Training data saved to {train.savepath}")
+
+        random.seed(train.seed)
+        torch.manual_seed(train.seed)
+        #torch.use_deterministic_algorithms(True) # Needed for reproducible results
+
+        printer("Creating dataset", end="")
+        # Create the dataset
+        dataset = dset.ImageFolder(
+            root=train.dataroot,
+            transform=transforms.Compose([
+                transforms.Grayscale(num_output_channels=1),
+                transforms.Resize((train.resize[0], train.resize[1])),
+                transforms.CenterCrop((train.resize[0], train.resize[1])),
+                transforms.RandomHorizontalFlip(p=0.5),
+                #transforms.GaussianBlur(kernel_size=(5)),
+                transforms.RandomAdjustSharpness(sharpness_factor=2),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5,), (0.5,)),
+             ])
+        )
+        print(f".... {str(len(dataset))} images available.")
+
+        printer("Creating dataloader", end="")
+        # Create the dataloader
+        self.dataloader = torch.utils.data.DataLoader(
+            dataset, 
+            batch_size=train.batch,
+            shuffle=True, 
+            num_workers=train.workers
+        )
+        print(f".... batch size {train.batch} .... {train.workers} workers")
+
+        # Specify GPUs
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Plot some training images
+        printer("Plotting training images") 
+
+        real_batch = next(iter(self.dataloader))
+        real_grid = vutils.make_grid(real_batch[0].to(self.device)[:64], padding=2, normalize=True)
+        real_grid = transforms.ToPILImage()(real_grid) 
+
+
+        #----------------------------------------------------------------------------
+        ## Model intialisation 
+        #----------------------------------------------------------------------------
+
+        self.netG = Generator_(train.gen_input, train.gen_features, train.channels).to(self.device)
+
+        printer(f"Generator model saved to {os.path.join(train.savepath,'netG_architecture.pt')}")
+        #netG_script = torch.jit.script(netG) # Export to TorchScript
+        #netG_script.save(os.path.join(train.savepath,'netG_architecture.pt')) # Save
+
+        # Handle multi-GPU if desired
+        if (self.device.type == 'cuda') and (len(general.gpus) > 1):
+            self.netG = nn.DataParallel(self.netG, list(int(d) for d in general.gpus))
+
+        # randomly initialize all weights to mean=0, stdev=0.02.
+        printer("Initialising random weights for Generator model")
+        self.netG.apply(weights_init)
+        print(self.netG)    
+     
+        # Create the Discriminator
+        self.netD = Discriminator(train.dis_features, train.channels).to(self.device)
+
+        printer(f"Discriminator model saved to {os.path.join(train.savepath,'netD_architecture.pt')}")
+        #netD_script = torch.jit.script(netD) # Export to TorchScript
+        #netD_script.save(os.path.join(train.savepath,'netD_architecture.pt')) # Save
+
+        # Handle multi-GPU if desired
+        if (self.device.type == 'cuda') and (len(general.gpus) > 1):
+            self.netD = nn.DataParallel(self.netD, list(int(d) for d in general.gpus))
+
+        # randomly initialize all weights to mean=0, stdev=0.02.
+        printer("Initialising random weights for Discriminator model")
+        self.netD.apply(weights_init)
+        print(self.netD)  
+
+        #----------------------------------------------------------------------------
+        ## Loss and Optimizer initialisation
+        #----------------------------------------------------------------------------
+
+        # Initialize the ``BCELoss`` function
+        self.criterionD = nn.BCELoss()
+        self.criterionG = nn.BCELoss()
+
+        # Create batch of latent vectors that we will use to visualize the progression of the generator
+        self.fixed_noise = torch.randn(64, train.gen_input, 1, 1, device=self.device)
+        torch.save(self.fixed_noise, os.path.join(train.savepath, 'fixed_noise.pt'))
+
+        # Initialise Adam optimisers
+        self.optimizerD = optim.Adam(self.netD.parameters(), lr=dis.lr, betas=(dis.beta1, 0.999))
+        self.optimizerG = optim.Adam(self.netG.parameters(), lr=gen.lr, betas=(gen.beta1, 0.999))
+
+        # Initiailise variables
+        self.num_gpus = len(general.gpus)
+        self.gen_input = train.gen_input
+        self.savepath = train.savepath
+        self.epochs = train.epochs
+        self.warmup = train.warmup_epochs
+        self.min_temp = train.min_temp
+        self.temperature = train.temperature
+        self.total_steps = self.epochs * len(self.dataloader)
+        self.temp_step = (self.temperature - self.min_temp) / (self.total_steps * 0.5)
+
+        self.experiment = experiment
+        # Run with experiement if true
+        if self.experiment:
+            self.experiment.set_name(folder)
+
+            # Log implementation of model
+            self.experiment.log_code(file_name='./src/models/discriminator.py')
+            self.experiment.log_code(file_name='./src/models/generator.py')
+
+            self.experiment.log_image(real_grid, name="Real images")
+
+            self.experiment.log_model('netG', os.path.join(train.savepath,'netG_architecture.pt'))
+            self.experiment.log_model('netD', os.path.join(train.savepath,'netD_architecture.pt'))
+
+            with self.experiment.train():
+
+                watch(self.netG)
+                watch(self.netD)
+
+                self.training_loop()
+
+            self.experiment.end()
+        else:
+            self.training_loop()
+
 #----------------------------------------------------------------------------
 
-def run (
-    train: type[dotdict], 
-    gen: type[dotdict], 
-    dis: type[dotdict], 
-    experiment: object
-):
-    #----------------------------------------------------------------------------
-    ## Dataset intialisation
-    #----------------------------------------------------------------------------
+    def get_state_dict(self):
+        # Module is only used with multi GPU 
+        if self.num_gpus > 1:
+            netG_state_dict = self.netG.module.state_dict()
+            netD_state_dict = self.netD.module.state_dict()
+        else:
+            netG_state_dict = self.netG.state_dict()
+            netD_state_dict = self.netD.state_dict()
 
-    folder = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    train.savepath = os.path.join(train.savepath, folder)
+        return (netG_state_dict, netD_state_dict)
 
-    experiment.set_name(folder)
+#----------------------------------------------------------------------------
 
-    # Log implementation of model
-    experiment.log_code(file_name='./src/models/discriminator.py')
-    experiment.log_code(file_name='./src/models/generator.py')
+    def save_state(self, epoch): 
+        netG_state_dict, netD_state_dict  = self.get_state_dict()
 
-    if not os.path.exists(train.savepath):
-        os.mkdir(train.savepath)
+        # Save current state for resumption        
+        try:
+            # Save state to allow resumption if failure
+            gen_state = {
+                'epoch': epoch,
+                'state_dict': netG_state_dict,
+                'optimizer': self.optimizerG.state_dict(),
+            }
+            with open(os.path.join(self.savepath, 'gen_checkpoint.t7'), 'wb') as f:
+                torch.save(gen_state, f)
 
-    train.epochpath = os.path.join(train.savepath, "epochs")
-    if not os.path.exists(train.epochpath):
-        os.mkdir(train.epochpath)
-            
-    printer(f"Training data saved to {train.savepath}")
-
-    random.seed(train.seed)
-    torch.manual_seed(train.seed)
-    torch.use_deterministic_algorithms(True) # Needed for reproducible results
-
-    printer("Creating dataset", end="")
-    # Create the dataset
-    dataset = dset.ImageFolder(
-        root=train.dataroot,
-        transform=transforms.Compose([
-            transforms.Grayscale(num_output_channels=train.channels),
-            transforms.Resize((train.resize[0], train.resize[1])),
-            transforms.CenterCrop((train.resize[0], train.resize[1])),
-            transforms.RandomHorizontalFlip(p=0.5),
-            #transforms.GaussianBlur(kernel_size=(5)),
-            transforms.RandomAdjustSharpness(sharpness_factor=2),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,)),
-         ])
-    )
-    print(f".... {str(len(dataset))} images available.")
-
-    printer("Creating dataloader", end="")
-    # Create the dataloader
-    dataloader = torch.utils.data.DataLoader(
-        dataset, 
-        batch_size=train.batch,
-        shuffle=True, 
-        num_workers=train.workers
-    )
-    print(f".... batch size {train.batch} .... {train.workers} workers")
-
-    # Specify GPUs
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Plot some training images
-    printer("Plotting training images")
-
-    real_batch = next(iter(dataloader))
-    real_grid = vutils.make_grid(real_batch[0].to(device)[:64], padding=2, normalize=True)
-    real_grid = transforms.ToPILImage()(real_grid) 
-
-    experiment.log_image(real_grid, name="Real images")
-    
-
-    #----------------------------------------------------------------------------
-    ## Model intialisation 
-    #----------------------------------------------------------------------------
-
-    netG = Generator(train.gen_input, train.gen_features, train.channels).to(device)
-
-    printer(f"Generator model saved to {os.path.join(train.savepath,'netG_architecture.pt')}")
-    #netG_script = torch.jit.script(netG) # Export to TorchScript
-    #netG_script.save(os.path.join(train.savepath,'netG_architecture.pt')) # Save
-    experiment.log_model('netG', os.path.join(train.savepath,'netG_architecture.pt'))
-
-    # Handle multi-GPU if desired
-    if (device.type == 'cuda') and (len(train.gpus) > 1):
-        netG = nn.DataParallel(netG, list(int(d) for d in train.gpus))
-
-    # randomly initialize all weights to mean=0, stdev=0.02.
-    printer("Initialising random weights for Generator model")
-    netG.apply(weights_init)
-    
-    if train.debug:
-        print(netG)    
- 
-    # Create the Discriminator
-    netD = Discriminator(train.dis_features, train.channels).to(device)
-
-    printer(f"Discriminator model saved to {os.path.join(train.savepath,'netD_architecture.pt')}")
-    #netD_script = torch.jit.script(netD) # Export to TorchScript
-    #netD_script.save(os.path.join(train.savepath,'netD_architecture.pt')) # Save
-    experiment.log_model('netD', os.path.join(train.savepath,'netD_architecture.pt'))
-
-    # Handle multi-GPU if desired
-    if (device.type == 'cuda') and (len(train.gpus) > 1):
-        netD = nn.DataParallel(netD, list(int(d) for d in train.gpus))
-
-    # randomly initialize all weights to mean=0, stdev=0.02.
-    printer("Initialising random weights for Discriminator model")
-    netD.apply(weights_init)
-
-    if train.debug:
-        print(netD)  
-
-    #----------------------------------------------------------------------------
-    ## Loss and Optimizer initialisation
-    #----------------------------------------------------------------------------
-
-    # Initialize the ``BCELoss`` function
-    criterionD = nn.BCELoss()
-    criterionG = nn.BCELoss()
-
-    # Create batch of latent vectors that we will use to visualize
-    #  the progression of the generator
-    fixed_noise = torch.randn(64, train.gen_input, 1, 1, device=device)
-
-    if dis.optimizer == "Adam":
-        optimizerD = optim.Adam(netD.parameters(), lr=dis.lr, betas=(dis.beta1, 0.999)) # should use SGD
-    elif dis.optimizer == "SGD":
-        optimizerD = optim.SGD(netD.parameters(), lr=dis.lr, momentum=0.9)
-
-    if gen.optimizer == "Adam":
-        optimizerG = optim.Adam(netG.parameters(), lr=gen.lr, betas=(gen.beta1, 0.999))
+            dis_state = {
+                'epoch': epoch,
+                'state_dict': netD_state_dict,
+                'optimizer': self.optimizerD.state_dict(),
+            }
+            with open(os.path.join(self.savepath, 'dis_checkpoint.t7'), 'wb') as f:
+                torch.save(dis_state, f)
+        except Exception as e:
+            printer(f"Error {str(e)}")
 
 
-    #----------------------------------------------------------------------------
-    ## Training Loop
-    #----------------------------------------------------------------------------
-    with experiment.train():
+#----------------------------------------------------------------------------
 
-        watch(netG)
-        watch(netD)
+    def epoch_eval(self, epoch):
+        # Generate fake image and save grid
+        with torch.no_grad():
+            fake = self.netG(self.fixed_noise).detach().cpu()                
 
+        # Get and expand images
+        real, _ = next(iter(self.dataloader))
+        real = torch.repeat_interleave(real, 3, dim=1)
+        fake = torch.repeat_interleave(fake, 3, dim=1)
+        fake = fake[0:32]
+        
+        # Calculate FID64
+        fid = FrechetInceptionDistance(feature=64, normalize=True)
+        fid.update(real, real=True)
+        fid.update(fake, real=False)
+        fid_score64 = fid.compute()
+
+        # Calculate FID2048
+        fid = FrechetInceptionDistance(feature=2048, normalize=True)
+        fid.update(real, real=True)
+        fid.update(fake, real=False)
+        fid_score2048 = fid.compute()
+
+        # Calculate KID
+        kid = KernelInceptionDistance(subset_size=32, normalize=True)
+        kid.update(real, real=True)
+        kid.update(fake, real=False)
+        kid_mean, kid_std = kid.compute()
+
+        # Calculate inception score
+        inception = InceptionScore(normalize=True)
+        inception.update(fake)
+        inception_score = inception.compute()
+
+        epoch_G_losses = np.average(self.epoch_G_losses)
+        epoch_D_losses = np.average(self.epoch_D_losses)
+        epoch_D_G_z1 = np.average(self.epoch_D_G_z1)
+        epoch_D_G_z2 = np.average(self.epoch_D_G_z2)
+        epoch_D_x = np.average(self.epoch_D_x)
+        epoch_top_k = np.average(self.epoch_top_k)
+
+        if self.experiment:
+            fake_grid = vutils.make_grid(fake, padding=2, normalize=True)
+            fake_grid = transforms.ToPILImage()(fake_grid) 
+            self.experiment.log_image(fake_grid, name=f"Fake_Images.jpg")
+
+            epoch_logger = {
+                "Epoch_Gen_Loss": epoch_G_losses, 
+                "Epoch_Dis_Loss": epoch_D_losses,
+                "Epoch_D_G_z1": epoch_D_G_z1,  
+                "Epoch_D_G_z2": epoch_D_G_z2,
+                "Epoch_D_x": epoch_D_x,
+                "Epoch_Top_K": epoch_top_k,
+                "FID_64": fid_score64,
+                "FID_2048": fid_score2048,
+                "Inception_0": inception_score[0],
+                "Inception_1": inception_score[1],
+                "KID_mean": kid_mean,
+                "KID_std": kid_std
+            }
+            self.experiment.log_metrics(epoch_logger, epoch=epoch)
+
+        # Output training stats
+        print_progress_bar(
+                len(self.dataloader), 
+                len(self.dataloader), 
+                prefix = f"Epoch {epoch+1} of {self.epochs}. Progress:", 
+                suffix = f"Complete. Loss_D: {epoch_D_losses:.4f}, Loss_G: {epoch_G_losses:.4f}, D(x): {epoch_D_x:.4f}, D(G(z)): {epoch_D_G_z1:.4f} / {epoch_D_G_z2:.4f}, FID_64: {fid_score64:.4f}, FID_2048: {fid_score2048:.4f}, Inception: {inception_score[0]:.4f}, {inception_score[1]:.4f}, KID mean / std: {kid_mean:.4f} / {kid_std:.4f}",
+                decimals = 1,
+                length = 30,
+                end = "\r\n"
+        )
+
+#----------------------------------------------------------------------------
+
+    def training_loop (self):
+        #--------------------------------------------------------------------
+        ## Training Loop
+        #--------------------------------------------------------------------
+        self.netG.train()
+        self.netD.train()
         step = 0
-        totalSteps = train.epochs * len(dataloader)
-        top_k = train.batch
-        min_k = int(train.batch * 0.3)
-
-        # Variables for saving models
-        dis_lowest_loss = float("inf")
-        gen_lowest_loss = float("inf")
-        D_G_z2_highest = 0
-
         printer("Starting Training Loop...")
         # For each epoch
-        for epoch in range(train.epochs):
-
+        for epoch in range(self.epochs):
             # Store for plotting
-            epoch_G_losses = []
-            epoch_D_losses = []
-            epoch_D_G_z1 = []
-            epoch_D_G_z2 = []
-            epoch_D_x = []
-            epoch_grad_penalty = []
-
-            
+            self.epoch_G_losses = []
+            self.epoch_D_losses = []
+            self.epoch_D_G_z1 = []
+            self.epoch_D_G_z2 = []
+            self.epoch_D_x = []
+            self.epoch_top_k = []         
 
             # For each batch in the dataloader
-            for i, data in enumerate(dataloader, 0):
+            for i, data in enumerate(self.dataloader, 0):
 
-                netD.zero_grad()
-                netG.zero_grad()
-                optimizerD.zero_grad()
-                optimizerG.zero_grad()
+                self.netD.zero_grad()
+                self.netG.zero_grad()
+                self.optimizerD.zero_grad()
+                self.optimizerG.zero_grad()
 
+
+                # Adjust the top elements to select
+                if epoch > self.warmup:                    
+                    self.temperature = (self.temperature - self.temp_step if self.temperature > self.min_temp else self.min_temp)
 
                 #--------------------------------------------------------------------
                 ## (1) Update D network: maximize log(D(x)) + log(1 - D(G(z)))
@@ -276,95 +422,96 @@ def run (
 
                 ## 1.a --------- Train with all-real batch
                 # Format batch
-                real_images = data[0].to(device)
+                real_images = data[0].to(self.device)
                 batch_size = real_images.size(0)
 
-                # Adjust the top elements to select
-                if epoch > train.warmup_epochs:
-                    top_k = batch_size - epoch
-                    if top_k < min_k:
-                        top_k = min_k
-                        
-                # Adjust qunatity to be filtered in Generator training
-                if top_k > batch_size: top_k = batch_size 
                 # Forward pass real batch through D
-                real_output = netD(real_images).view(-1)
-                real_labels = get_real_labels(batch_size, device)
+                real_output = self.netD(real_images).view(-1)
+                real_labels = get_real_labels(batch_size, self.device)
                 # Calculate loss on all-real batch
-                loss_D_real = criterionD(real_output, real_labels)
+                loss_D_real = self.criterionD(real_output, real_labels)
                 # Calculate gradients for D in backward pass
                 loss_D_real.backward()
                 D_x = real_output.mean().item()
 
+
                 ## 1.b --------- Train with all-fake batch
                 # Generate batch of latent vectors
-                noise = torch.randn(batch_size, train.gen_input, 1, 1, device=device)
+                noise = torch.randn(batch_size, self.gen_input, 1, 1, device=self.device)
                 # Generate fake image batch with G
-                fake_images = netG(noise)            
+                fake_images = self.netG(noise)          
                 # Classify all fake batch with D and Get labels
-                fake_output = netD(fake_images.detach()).view(-1)                
+                fake_output = self.netD(fake_images.detach()).view(-1)                   
+                # Calculate top_k based on (norm(x) - (1-T))*B             
+                top_k = get_top_k(fake_output, self.temperature, batch_size, (epoch < self.warmup))   
+                # Filter            
                 fake_output, _ = torch.topk(fake_output, top_k)
-                fake_labels = get_fake_labels(top_k, device)
+                fake_labels = get_fake_labels(top_k, self.device)
                 # Calculate D's loss on the all-fake batch
-                loss_D_fake = criterionD(fake_output, fake_labels)
+                loss_D_fake = self.criterionD(fake_output, fake_labels)
                 # Calculate the gradients for this batch,
                 loss_D_fake.backward()                
                 D_G_z1 = fake_output.mean().item()
                 # Update D
-                optimizerD.step()
+                self.optimizerD.step()
                 #Compute error of D as sum over the fake and the real batches
-                loss_D = loss_D_real + loss_D_fake        
+                loss_D = loss_D_real + loss_D_fake
 
-                # Adversarial loss
-                adversarial_loss = 0 #-D_x + D_G_z1 + lambda_gp * gradient_penalty    
+                self.epoch_D_losses.append(loss_D.item())
+                self.epoch_D_G_z1.append(D_G_z1)
+                self.epoch_D_x.append(D_x)
 
-                
                 #--------------------------------------------------------------------
                 ## (2) Update G network: maximize log(D(G(z)))           
-                #--------------------------------------------------------------------                
+                #--------------------------------------------------------------------        
+
                 # Since we just updated D, perform another forward pass of all-fake batch through D
-                output = netD(fake_images).view(-1)
+                output = self.netD(fake_images).view(-1)
+                # Calculate top_k based on (norm(x) - (1-T))*B
+                top_k = get_top_k(output, self.temperature, batch_size, (epoch < self.warmup))
+                # Filter 
                 output, _ = torch.topk(output, top_k)
-                labels = get_real_labels(top_k, device)
+                labels = get_real_labels(top_k, self.device)
                 # Calculate G's loss based on this output
-                loss_G = criterionG(output, labels)
+                loss_G = self.criterionG(output, labels)                                
                 # Calculate gradients for G
                 loss_G.backward()
                 D_G_z2 = output.mean().item()
-                # Update G
-                optimizerG.step()
+                self.optimizerG.step()
+
+                self.epoch_top_k.append(top_k / batch_size)
+                self.epoch_G_losses.append(loss_G.item())
+                self.epoch_D_G_z2.append(D_G_z2)
 
                 #--------------------------------------------------------------------
                 ## (3) Output training stats:
                 #--------------------------------------------------------------------
 
+
+                # Flare
+                #if temperature < 0.5 and random.uniform(0,1) > 0.9:
+                #    temperature += 0.3
+
                 print_progress_bar(
-                        i+1, 
-                        len(dataloader), 
-                        prefix = f"Epoch {epoch+1} of {train.epochs}. Progress:", 
-                        suffix = f"Complete. Loss_D: {loss_D.item():.4f}, Loss_G: {loss_G.item():.4f}, D(x): {D_x:.4f}, D(G(z)): {D_G_z1:.4f} / {D_G_z2:.4f}, Adversarial Loss: {adversarial_loss:.4f}",
-                        decimals = 1,
-                        length = 30,
+                    i+1, 
+                    len(self.dataloader), 
+                    prefix = f"Epoch {epoch+1} of {self.epochs}. Progress:", 
+                    suffix = f"Complete. Loss_D: {loss_D.item():.4f}, Loss_G: {loss_G.item():.4f}, D(x): {D_x:.4f}, D(G(z)): {D_G_z1:.4f} / {D_G_z2:.4f}, Top_K: {top_k} / {batch_size} ({(top_k / batch_size):.4f}), Temp: {self.temperature:.5f}",
+                    decimals = 1,
+                    length = 30,
                 )
 
-                # Save epoch results for averagers
-                epoch_G_losses.append(loss_G.item())
-                epoch_D_losses.append(loss_D.item())
-                epoch_D_G_z1.append(D_G_z1)
-                epoch_D_G_z2.append(D_G_z2)
-                epoch_D_x.append(D_x)
-                epoch_grad_penalty.append(adversarial_loss)
-
-                # Log
-                step_logger = {
-                    "Gen_Loss": loss_G.item(),
-                    "Dis_Loss": loss_D.item(),
-                    "D_G_z1": D_G_z1,
-                    "D_G_z2": D_G_z2,
-                    "Avg. Output": D_x,
-                    "Adversarial_Loss": adversarial_loss
-                }
-                experiment.log_metrics(step_logger, step=step)
+                if self.experiment:
+                    # Log
+                    step_logger = {
+                        "Gen_Loss": loss_G.item(),
+                        "Dis_Loss": loss_D.item(),
+                        "D_G_z1": D_G_z1,
+                        "D_G_z2": D_G_z2,
+                        "Avg. Output": D_x,
+                        "Top_K": epoch_top_k[0]
+                    }
+                    self.experiment.log_metrics(step_logger, step=step)
 
                 step += 1
 
@@ -373,75 +520,23 @@ def run (
             ## Log data (end of epoch)
             #------------------------------------------------------------------------
 
-            epoch_G_losses = np.average(epoch_G_losses)
-            epoch_D_losses = np.average(epoch_D_losses)
-            epoch_D_G_z1 = np.average(epoch_D_G_z1)
-            epoch_D_G_z2 = np.average(epoch_D_G_z2)
-            epoch_D_x = np.average(epoch_D_x)
-            epoch_grad_penalty = np.average(epoch_grad_penalty)
-
-            epoch_logger = {
-                "Epoch_Gen_Loss": epoch_G_losses, 
-                "Epoch_Dis_Loss": epoch_D_losses,
-                "Epoch_D_G_z1": epoch_D_G_z1, 
-                "Epoch_D_G_z2": epoch_D_G_z2,
-                "Epoch_D_x": epoch_D_x,
-                "Epoch_grad_penalty": epoch_grad_penalty
-            }
-
-            experiment.log_metrics(epoch_logger, epoch=epoch)
-
-            # Output training stats
-            print_progress_bar(
-                    len(dataloader), 
-                    len(dataloader), 
-                    prefix = f"Epoch {epoch+1} of {train.epochs}. Progress:", 
-                    suffix = f"Complete. Loss_D: {epoch_D_losses:.4f}, Loss_G: {epoch_G_losses:.4f}, D(x): {epoch_D_x:.4f}, D(G(z)): {epoch_D_G_z1:.4f} / {epoch_D_G_z2:.4f}",
-                    decimals = 1,
-                    length = 30,
-                    end = "\r\n"
-            )
-
-            # Generate fake image and save grid
-            fake = netG(fixed_noise).detach().cpu()
-            fake_grid = vutils.make_grid(fake, padding=2, normalize=True)
-            fake_grid = transforms.ToPILImage()(fake_grid) 
-            
-            experiment.log_image(fake_grid, name=f"{str(epoch).zfill(8)}")
+            self.epoch_eval(epoch)
 
             # Save current state for resumption
-            try:
-                # Save state to allow resumption if failure
-                gen_state = {
-                    'epoch': epoch,
-                    'state_dict': netG.state_dict(),
-                    'optimizer': optimizerG.state_dict(),
-                }
-                #with open(os.path.join(train.savepath, 'gen_checkpoint.t7'), 'wb') as f:
-                #    torch.save(gen_state, f)
+            if (epoch % 20) == 0:
+                self.save_state(epoch)
 
-                dis_state = {
-                    'epoch': epoch,
-                    'state_dict': netD.state_dict(),
-                    'optimizer': optimizerD.state_dict(),
-                }
+        #----------------------------------------------------------------------------
+        ## End of Training Loop
+        #----------------------------------------------------------------------------
 
-                #with open(os.path.join(train.savepath, 'dis_checkpoint.t7'), 'wb') as f:
-                #    torch.save(dis_state, f)
-            except Exception as e:
-                printer(f"Error {str(e)}")
-
-    #----------------------------------------------------------------------------
-    ## End of Training Loop
-    #----------------------------------------------------------------------------
-
-    # Save final models
-    torch.save(netG.state_dict(), os.path.join(train.savepath, 'netg_final.pth'))
-    torch.save(netD.state_dict(), os.path.join(train.savepath, 'netd_final.pth'))
-
-    experiment.end()
+        # Save final models
+        netG_state_dict, netD_state_dict  = self.get_state_dict()
+        torch.save(netG_state_dict, os.path.join(self.savepath, 'netg_final.pth'))
+        torch.save(netD_state_dict, os.path.join(self.savepath, 'netd_final.pth'))
 
 #----------------------------------------------------------------------------
+
 
 if __name__ == "__main__":
 
@@ -451,6 +546,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    #----------------------------------------------------------------------------
 
     if not os.path.isfile(args.config):
         printer("Error configuration file not found")
@@ -465,12 +561,13 @@ if __name__ == "__main__":
             printer(str(e))
             exit(0)
 
-
+    #----------------------------------------------------------------------------
 
     # Covert accesibility to dot
     config          = dotdict(config_raw)
     config.comet    = dotdict(config.comet_dl)
     config.train    = dotdict(config.train)
+    config.general  = dotdict(config.general)
     config.gen      = dotdict(config.generator)
     config.dis      = dotdict(config.discriminator)
     config_errors = False
@@ -495,17 +592,11 @@ if __name__ == "__main__":
 
     printer_config("seed", config.train.seed)
 
-    #----------------------------------------------------------------------------
-
-    if not config.train.cache:
-        config.train.cache = "cache.pt"
-
-    printer_config("cache", config.train.cache)
 
     #----------------------------------------------------------------------------
 
     if not config.train.resize:
-        config.train.resize = [128, 128]
+        config.train.resize = [256, 256]
     else:
         try:
             resize = config.train.resize.split("x")
@@ -522,11 +613,11 @@ if __name__ == "__main__":
 
     #----------------------------------------------------------------------------
 
-    if config.train.gpus:
+    if config.general.gpus:
         try: 
-            config.train.gpus = config.train.gpus.split(",")
+            config.general.gpus = config.general.gpus.split(",")
             
-            printer_config("gpus", config.train.gpus)
+            printer_config("gpus", config.general.gpus)
 
         except Exception as e:
             printer("Error unable to parse gpus, please ensure format is \"int,int,etc.\".")
@@ -638,45 +729,57 @@ if __name__ == "__main__":
 
     #----------------------------------------------------------------------------
 
+    if config.comet.log:
+        try: 
+            config.comet.log = int(config.comet.log)   
 
-    if (not os.path.isfile(config.comet.path)):
-        printer("Error invalid comet path specified in config file.") 
-        config_errors = True
-    else:   
-        printer_config("comet", config.comet.path)
+            if config.comet.log == 1:
+                if (not os.path.isfile(config.comet.path)):
+                    printer("Error invalid comet path specified in config file.") 
+                    config_errors = True
+                else:   
+                    with open(config.comet.path) as comet_file:
+                        try:
+                            comet = json.load(comet_file)
+                            config.comet = dotdict(comet)
+                        except Exception as e:
+                            printer(f"Error reading configuration file {config.comet.path}")
+                            printer(str(e))
+                            config_errors = True
 
-        with open(config.comet.path) as comet_file:
-            try:
-                comet = json.load(comet_file)
-                config.comet = dotdict(comet)
-            except Exception as e:
-                printer(f"Error reading configuration file {config.comet.path}")
-                printer(str(e))
-                config_errors = True
+
+        except Exception as e:
+            printer("Error unable to parse comet_dl.log, please enter integer 1 (True) or 0 (False).")
+            printer(str(e))
+            config_errors = True
+
+
 
     #----------------------------------------------------------------------------
 
     if config_errors:
         exit(0)
-    else:
-        # setup the experiement        
-        experiment = Experiment (
-            api_key = config.comet.api_key,
-            project_name = config.comet.project_name,
-            workspace = config.comet.workspace,
-            log_env_details = False
-        )
+    else: 
+        if config.comet.log == 1:
+            # setup the experiement        
+            experiment = Experiment (
+                api_key = config.comet.api_key,
+                project_name = config.comet.project_name,
+                workspace = config.comet.workspace,
+                log_env_details = False
+            )
 
 
-        parameters = {
-            "train": config_raw['train'],
-            "generator": config_raw['generator'],
-            "discriminator": config_raw['discriminator']
-        }
+            parameters = {
+                "train": config_raw['train'],
+                "generator": config_raw['generator'],
+                "discriminator": config_raw['discriminator'],
+                "general": config_raw['general']
+            }
 
-        experiment.log_parameters(parameters)
-
+            experiment.log_parameters(parameters)
+        else:
+            experiment = None
 
         # Train
-        run(config.train, config.gen, config.dis, experiment)
-
+        Train(config.train, config.gen, config.dis, config.general, experiment)

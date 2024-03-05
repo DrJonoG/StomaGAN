@@ -55,7 +55,7 @@ class dotdict(dict):
     __setattr__ = dict.__setitem__
     __delattr__ = dict.__delitem__
 
-#----------------------------------------------------------------------------++# Print iterations progress
+#----------------------------------------------------------------------------
 
 def print_progress_bar (
     iteration: int, 
@@ -86,3 +86,19 @@ def print_progress_bar (
     # Print New Line on Complete
     if iteration == total: 
         print()
+
+#----------------------------------------------------------------------------
+
+def parse_int (
+    parameter: str,
+    value: any, 
+    min_val: int = 0, 
+    max_val: int = 1000000
+) -> bool:
+    try: 
+        value = int(value)
+        if value < min_val or value > max_val: 
+            raise TypeError()
+    except Exception as e:
+        printer(f"Error unable to parse {parameter}, please enter a positive integer between {min_val}-{max_val}.")
+        return True

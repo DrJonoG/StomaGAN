@@ -1,24 +1,33 @@
 {
+	"general": 
+	{
+		"gpus":                 "0",
+		"gen_input":            128,
+		"gen_features":         64,
+		"channels":				1,		
+		"debug":                1
+	},
+
 	"train": 
 	{
 		"dataroot":             "./data/",
 		"savepath":				"./training/",
-		"seed":                 999, 					
-		"cache":           		"SavedState.pth",
+		"seed":                 999,
 		"resize":           	"256x256",
 		"channels":				1, 					
 
 		"workers":          	8,
 		"batch":          		32,
-		"epochs":               50,
+		"epochs":               750,
 		"warmup_epochs":		5,
-		"gpus":                 "0,1", 
 
 		"gen_input":            128, 
 		"gen_features":         64,
 		"dis_features":     	16, 
 
-		"debug":                1
+		"min_temp":				0.3,
+		"temperature":			1.0
+
 	},
 
 	"generate":
@@ -28,14 +37,13 @@
 		"channels":				1,
 		"gen_input":            128, 
 		"gen_features":         64,
-		"qty":					128,
-
-		"gpus":                 "0,1"
+		"qty":					128
 	},
 
 
 	"comet_dl": 
 	{
+		"log":					0,
 		"path":                 "./comet.json"
 	},
 
@@ -55,6 +63,18 @@
 		"optimizer":            "Adam",
 		"beta1":                0.5, 
 		"saved_weights_name":   "Disciminator.pt"
+	},
+
+
+	"create": 
+	{
+		"source":				"./training/2024-02-28-17-45-24/netg_final.pth",
+		"destination":			"./results/create/",
+		"quantity":				1024,
+		"dimensions":			"2048x1024",
+		"arrangement":			"line",
+		"spacing":				"sparse",
+		"magnification":		100
 	}
 
 }

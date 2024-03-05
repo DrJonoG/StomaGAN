@@ -19,19 +19,19 @@ import torchvision.utils as vutils
 from utils.helpers import printer, dotdict
 from torchvision.utils import save_image
 from argparse import ArgumentParser
-from models import Generator
+from models import Generator_
 
 #----------------------------------------------------------------------------
 
 def main (
 	config: object
 ) -> None:
-    gpus = config.gpus.split(",")
+    gpus = general.gpus.split(",")
 	# set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # load generator model
-    netG = Generator(config.gen_input, config.gen_features, config.channels).to(device)
+    netG = Generator_(config.gen_input, config.gen_features, config.channels).to(device)
 
     # If trained on multiple GPUs this must also be loaded into DataParallel
     if (device.type == 'cuda') and (len(gpus) > 1):
@@ -47,12 +47,6 @@ def main (
     printer(f"Saving {config.qty} fake images to {config.destination}.")   
     for image in fake:   
         save_image(image, os.path.join(config.destination, str(int(time.time()*1000.0))) + ".jpg")
-    #img = vutils.make_grid(fake, padding=2, normalize=True)
-
-    # save image
-    #plt.axis("off")
-    #plt.imshow(np.transpose(img,(1,2,0)))
-    #plt.show()
 
 #----------------------------------------------------------------------------
 
@@ -82,6 +76,7 @@ if __name__ == '__main__':
 
     # Covert accesibility to dot
     config = dotdict(config_raw['generate'])
+    general = dotdict(config_raw['general'])
 
     if not os.path.isfile(config.model_path):
         printer(f"Error -> The model file {config.model_path} cannot be found.")

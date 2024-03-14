@@ -45,48 +45,15 @@ from argparse import ArgumentParser
 
 #----------------------------------------------------------------------------
 
-def calculate_gradient_penalty (
-    model, 
-    real_images, 
-    fake_images, 
-    device
-):
-    """Calculates the gradient penalty loss for WGAN GP"""
-    # Random weight term for interpolation between real and fake data
-    alpha = torch.randn((real_images.size(0), 1, 1, 1), device=device)
-    # Get random interpolation between real and fake data
-    interpolates = (alpha * real_images + ((1 - alpha) * fake_images)).requires_grad_(True)
-
-    model_interpolates = model(interpolates)
-    grad_outputs = torch.ones(model_interpolates.size(), device=device, requires_grad=False)
-
-    # Get gradient w.r.t. interpolates
-    gradients = torch.autograd.grad(
-        outputs=model_interpolates,
-        inputs=interpolates,
-        grad_outputs=grad_outputs,
-        create_graph=True,
-        retain_graph=True,
-        only_inputs=True,
-    )[0]
-    gradients = gradients.view(gradients.size(0), -1)
-    gradient_penalty = torch.mean((gradients.norm(2, dim=1) - 1) ** 2)
-    return gradient_penalty
-
-#----------------------------------------------------------------------------
-
 def get_real_labels(batch_size, device):
-    labels = np.random.uniform(0.8, 1.0, size=(batch_size,))
-    #return torch.full((batch_size,), 1.0, dtype=torch.float, device=device)   
+    labels = np.random.uniform(0.8, 1.0, size=(batch_size,))  
     return torch.from_numpy(labels).float().to(device)
 
 #----------------------------------------------------------------------------
 
 def get_fake_labels(batch_size, device):
-    labels = np.random.uniform(0.0, 0.2, size=(batch_size,))
-    #return torch.full((batch_size,), 0.0, dtype=torch.float, device=device)    
+    labels = np.random.uniform(0.0, 0.2, size=(batch_size,))   
     return torch.from_numpy(labels).float().to(device)
-
 
 #----------------------------------------------------------------------------
 
@@ -113,6 +80,7 @@ def weights_init(m):
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0)
 
+#----------------------------------------------------------------------------
 
 class Train:
     def __init__(
@@ -185,7 +153,7 @@ class Train:
         ## Model intialisation 
         #----------------------------------------------------------------------------
 
-        self.netG = Generator_(train.gen_input, train.gen_features, train.channels).to(self.device)
+        self.netG = Generator_(train.gen_input, train.gen_features, train.channels, train.resize[0]).to(self.device)
 
         printer(f"Generator model saved to {os.path.join(train.savepath,'netG_architecture.pt')}")
         #netG_script = torch.jit.script(netG) # Export to TorchScript
@@ -201,7 +169,7 @@ class Train:
         print(self.netG)    
      
         # Create the Discriminator
-        self.netD = Discriminator(train.dis_features, train.channels).to(self.device)
+        self.netD = Discriminator(train.dis_features, train.channels, train.resize[0]).to(self.device)
 
         printer(f"Discriminator model saved to {os.path.join(train.savepath,'netD_architecture.pt')}")
         #netD_script = torch.jit.script(netD) # Export to TorchScript
@@ -295,7 +263,7 @@ class Train:
                 'optimizer': self.optimizerG.state_dict(),
             }
             with open(os.path.join(self.savepath, 'gen_checkpoint.t7'), 'wb') as f:
-                torch.save(gen_state, f)
+                torch.save([self.netG.kwargs, gen_state], f)
 
             dis_state = {
                 'epoch': epoch,
@@ -303,17 +271,19 @@ class Train:
                 'optimizer': self.optimizerD.state_dict(),
             }
             with open(os.path.join(self.savepath, 'dis_checkpoint.t7'), 'wb') as f:
-                torch.save(dis_state, f)
+                torch.save([self.netD.kwargs, dis_state], f)
         except Exception as e:
             printer(f"Error {str(e)}")
-
 
 #----------------------------------------------------------------------------
 
     def epoch_eval(self, epoch):
         # Generate fake image and save grid
         with torch.no_grad():
-            fake = self.netG(self.fixed_noise).detach().cpu()                
+            fake = self.netG(self.fixed_noise).detach().cpu()
+            if self.experiment:
+                fake_grid = vutils.make_grid(fake, padding=2, normalize=True)
+                fake_grid = transforms.ToPILImage()(fake_grid)                
 
         # Get and expand images
         real, _ = next(iter(self.dataloader))
@@ -352,9 +322,7 @@ class Train:
         epoch_top_k = np.average(self.epoch_top_k)
 
         if self.experiment:
-            fake_grid = vutils.make_grid(fake, padding=2, normalize=True)
-            fake_grid = transforms.ToPILImage()(fake_grid) 
-            self.experiment.log_image(fake_grid, name=f"Fake_Images.jpg")
+            self.experiment.log_image(fake_grid, name=f"Fake_Images")
 
             epoch_logger = {
                 "Epoch_Gen_Loss": epoch_G_losses, 
@@ -509,7 +477,7 @@ class Train:
                         "D_G_z1": D_G_z1,
                         "D_G_z2": D_G_z2,
                         "Avg. Output": D_x,
-                        "Top_K": epoch_top_k[0]
+                        "Top_K": (top_k / batch_size)
                     }
                     self.experiment.log_metrics(step_logger, step=step)
 
@@ -532,11 +500,10 @@ class Train:
 
         # Save final models
         netG_state_dict, netD_state_dict  = self.get_state_dict()
-        torch.save(netG_state_dict, os.path.join(self.savepath, 'netg_final.pth'))
-        torch.save(netD_state_dict, os.path.join(self.savepath, 'netd_final.pth'))
+        torch.save([self.netG.kwargs, netG_state_dict], os.path.join(self.savepath, 'netg_final.pth'))
+        torch.save([self.netD.kwargs, netD_state_dict], os.path.join(self.savepath, 'netd_final.pth'))
 
 #----------------------------------------------------------------------------
-
 
 if __name__ == "__main__":
 
@@ -565,7 +532,7 @@ if __name__ == "__main__":
 
     # Covert accesibility to dot
     config          = dotdict(config_raw)
-    config.comet    = dotdict(config.comet_dl)
+    config.comet_dl = dotdict(config.comet_dl)
     config.train    = dotdict(config.train)
     config.general  = dotdict(config.general)
     config.gen      = dotdict(config.generator)
@@ -605,10 +572,13 @@ if __name__ == "__main__":
             else:
                 config.train.resize = [int(resize[0]), int(resize[1])]
 
+            if not (config.train.resize[0] > 0 and (config.train.resize[0] & (config.train.resize[0]-1) == 0)):
+                raise TypeError()
+
             printer_config("resize",f"{config.train.resize[0]}x{config.train.resize[1]}")
 
         except Exception as e:
-            printer("Error reading resize. Please ensure format is \"widthxheight\"")
+            printer("Error processing resize. Please ensure format is \"widthxheight\" and a power of 2")
             config_errors = True
 
     #----------------------------------------------------------------------------
@@ -704,7 +674,7 @@ if __name__ == "__main__":
             if config.train.gen_features < 0 and not  ((config.train.gen_features != 0) and (config.train.gen_features & (config.train.gen_features-1) == 0)): 
                 raise TypeError()
 
-            printer_config("gen_features", config.train.gen_input)
+            printer_config("gen_features", config.train.gen_features)
             
         except Exception as e:
             printer("Error unable to parse gen_features, please enter a integer to the power of 2.")
@@ -729,38 +699,36 @@ if __name__ == "__main__":
 
     #----------------------------------------------------------------------------
 
-    if config.comet.log:
+    if config.comet_dl.log:
         try: 
-            config.comet.log = int(config.comet.log)   
+            config.comet_dl.log = int(config.comet_dl.log)   
 
-            if config.comet.log == 1:
-                if (not os.path.isfile(config.comet.path)):
+            if config.comet_dl.log == 1:
+                if (not os.path.isfile(config.comet_dl.path)):
                     printer("Error invalid comet path specified in config file.") 
                     config_errors = True
-                else:   
-                    with open(config.comet.path) as comet_file:
+                else:
+                    with open(config.comet_dl.path) as comet_file:
                         try:
                             comet = json.load(comet_file)
                             config.comet = dotdict(comet)
                         except Exception as e:
-                            printer(f"Error reading configuration file {config.comet.path}")
+                            printer(f"Error reading configuration file {config.comet_dl.path}")
                             printer(str(e))
                             config_errors = True
-
-
         except Exception as e:
             printer("Error unable to parse comet_dl.log, please enter integer 1 (True) or 0 (False).")
             printer(str(e))
             config_errors = True
 
 
-
+    
     #----------------------------------------------------------------------------
 
     if config_errors:
         exit(0)
     else: 
-        if config.comet.log == 1:
+        if config.comet_dl.log:
             # setup the experiement        
             experiment = Experiment (
                 api_key = config.comet.api_key,

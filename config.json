@@ -8,17 +8,23 @@
 		"debug":                1
 	},
 
+	"comet_dl": 
+	{
+		"log":					1,
+		"path":                 "./comet.json"
+	},
+
 	"train": 
 	{
-		"dataroot":             "./data/",
+		"dataroot":             "./data_wheat/", 
 		"savepath":				"./training/",
 		"seed":                 999,
-		"resize":           	"256x256",
+		"resize":           	"512x512",
 		"channels":				1, 					
 
 		"workers":          	8,
 		"batch":          		32,
-		"epochs":               750,
+		"epochs":               500,
 		"warmup_epochs":		5,
 
 		"gen_input":            128, 
@@ -30,24 +36,6 @@
 
 	},
 
-	"generate":
-	{
-		"model_path":			"./training/2024-02-26-10-08-35/gen_D_G_z2_highest.pth",
-		"destination":			"./results/gen_D_G_z2_highest/",
-		"channels":				1,
-		"gen_input":            128, 
-		"gen_features":         64,
-		"qty":					128
-	},
-
-
-	"comet_dl": 
-	{
-		"log":					0,
-		"path":                 "./comet.json"
-	},
-
-
 	"generator": 
 	{
 		"lr":        			2e-4,
@@ -56,25 +44,11 @@
 		"saved_weights_name":   "Generator.pt"
 	},
 
-
 	"discriminator": 
 	{
 		"lr":        			2e-4,
 		"optimizer":            "Adam",
 		"beta1":                0.5, 
 		"saved_weights_name":   "Disciminator.pt"
-	},
-
-
-	"create": 
-	{
-		"source":				"./training/2024-02-28-17-45-24/netg_final.pth",
-		"destination":			"./results/create/",
-		"quantity":				1024,
-		"dimensions":			"2048x1024",
-		"arrangement":			"line",
-		"spacing":				"sparse",
-		"magnification":		100
 	}
-
 }

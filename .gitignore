@@ -167,4 +167,5 @@ comet.json
 docs/*
 results/*
 data/*
-paper/*
+data_wheat
+paper

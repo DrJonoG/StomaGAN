@@ -1,0 +1,28 @@
+{
+	"samples":
+	{
+		"model_path":			"./training/Wheat/netg_final.pth",
+		"destination":			"./results/wheat2/",
+		"channels":				1,
+		"gen_input":            128, 
+		"gen_features":         64,
+		"qty":					32,
+		"batches":				20,
+		"gpus":					"0"
+	},
+
+	"images":
+	{
+		"source":				"./results/wheat2/",
+		"destination":			"./results/wheat2/full",
+		"image_qty":			200,
+		"min_samples":			20,
+		"max_samples":			25,
+		"size":					512,
+		"noise":				0,
+		"boundary":				10,
+		"min_scale":			0.2,
+		"max_scale":			0.5,
+		"draw_contours":		0					
+	}
+}

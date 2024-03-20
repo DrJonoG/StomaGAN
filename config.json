@@ -16,15 +16,15 @@
 
 	"train": 
 	{
-		"dataroot":             "./data_wheat/", 
+		"dataroot":             "./data/", 
 		"savepath":				"./training/",
 		"seed":                 999,
-		"resize":           	"512x512",
+		"resize":           	"256x256",
 		"channels":				1, 					
 
 		"workers":          	8,
 		"batch":          		32,
-		"epochs":               500,
+		"epochs":               2500,
 		"warmup_epochs":		5,
 
 		"gen_input":            128, 

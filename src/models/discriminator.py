@@ -25,31 +25,24 @@ class Discriminator(nn.Module):
 
         self.kwargs = {
             'dis_features': dis_features, 
-            'channels': channels
+            'channels': channels,
+            'dimensions': dimensions
         }
 
         #--------------------------------------------------------------------
         ## Adjustments to Discriminator to easily adapt to changes in image dimensions
         #--------------------------------------------------------------------
 
-        n = int(dimensions / 8)
-        n_layers = int(log(n, 2))
+        n_layers = 4 #int(log(dimensions)/log(2)) - 2
         
         conv_blocks = []
-        
-        # Input layer
-        conv_blocks.append(
-            nn.Sequential(
-                nn.Conv2d(channels, dis_features, 4, stride=2, padding=1, bias=False),
-                nn.PReLU(),
-                nn.Dropout(0.4)
-            )
-        )
+
+        conv_blocks.append(self._block(channels, dis_features,  layer="input"))
 
         for i in range(0, n_layers):
-            conv_blocks.append(self._block((dis_features * (2**i)), (dis_features * (2**(i+1))), 4, stride=2, padding=1))
+            conv_blocks.append(self._block((dis_features * (2**i)), (dis_features * (2**(i+1)))))
 
-        conv_blocks.append(self._block(dis_features * n, 1, 4, 1, 0, final_layer=True))
+        conv_blocks.append(self._block(dis_features * (2**n_layers), 1,  layer="final"))
 
         self.main = nn.Sequential(*conv_blocks)
 
@@ -60,22 +53,28 @@ class Discriminator(nn.Module):
         self, 
         in_channels, 
         out_channels, 
-        kernel_size, 
-        stride,  
-        padding,
-        final_layer=False
+        layer="hidden"
     ):
-        if final_layer:
+        if layer == "final":
             return nn.Sequential (
-                nn.utils.spectral_norm(nn.Conv2d(in_channels, out_channels, kernel_size, stride)),
+                nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2),
                 nn.Sigmoid()
             )
-        else:
+        elif layer == "input":
             return nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
+                nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.PReLU(),
+                nn.Dropout(0.5)
+            )
+        elif layer == "hidden":
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1, bias=False),
                 nn.BatchNorm2d(out_channels),                
                 nn.PReLU(),
-                nn.Dropout(0.4)
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),                
+                nn.PReLU(),
+                nn.Dropout(0.5)
             )
 
     #------------------------------------------------------------------------

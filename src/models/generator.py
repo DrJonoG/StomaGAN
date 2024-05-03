@@ -9,6 +9,7 @@
 #----------------------------------------------------------------------------
 
 import torch.nn as nn
+from math import log
 
 #----------------------------------------------------------------------------
     
@@ -34,20 +35,19 @@ class Generator_(nn.Module):
         ## Adjustments to Generator to easily adapt to changes in image dimensions
         #--------------------------------------------------------------------
 
-        n = int(dimensions / 8)
+
+
+        n_layers = 4 #int(log(dimensions)/log(2)) - 2
 
         conv_blocks = []
 
-        # Input layer
-        conv_blocks.append(self._block(gen_input, int(gen_features * n), 4, 1, 0))
+        conv_blocks.append(self._block(gen_input, int(gen_features * (2**n_layers)), 4, 1, 0, layer = "input"))
 
-        # Hidden layers
-        while (n % 2) == 0:
-            conv_blocks.append(self._block(int(gen_features * n), int(gen_features * (n / 2)), 4, 2, 1))
-            n //= 2
+        for i in range(n_layers, 0, -1):
+            conv_blocks.append(self._block((gen_features * (2**i)), (gen_features * (2**(i-1))),  4, 2, 1))
 
         # Output layer
-        conv_blocks.append(self._block(gen_features, channels, 4, 2, 1, final_layer=True))
+        conv_blocks.append(self._block(gen_features, channels, 4, 2, 1, layer="final"))
 
         self.main = nn.Sequential(*conv_blocks)
 
@@ -60,18 +60,21 @@ class Generator_(nn.Module):
         kernel_size, 
         stride, 
         padding,
-        final_layer=False
+        layer="hidden"
     ):
-        if final_layer:
+        if layer == "final":
             return nn.Sequential (
-                nn.utils.spectral_norm(nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding)),
+                nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding),
                 nn.Tanh()
             )
-        else:    
+        elif layer == "hidden" or layer == "input":    
             return nn.Sequential(
                 nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, bias=False),
                 nn.BatchNorm2d(out_channels),
-                nn.PReLU()
+                nn.ReLU(),
+                nn.ConvTranspose2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU()
                 #nn.LeakyReLU(0.2, inplace=True)
             )
 

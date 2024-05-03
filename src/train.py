@@ -15,6 +15,7 @@ from comet_ml.integration.pytorch import log_model, watch
 import os
 import math
 import copy
+import time
 import json
 import torch
 import random
@@ -30,8 +31,6 @@ import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
 
-
-
 import matplotlib.pyplot as plt
 
 from models import Generator_, Discriminator
@@ -46,13 +45,13 @@ from argparse import ArgumentParser
 #----------------------------------------------------------------------------
 
 def get_real_labels(batch_size, device):
-    labels = np.random.uniform(0.8, 1.0, size=(batch_size,))  
+    labels = np.random.uniform(0.9, 1.0, size=(batch_size,))  
     return torch.from_numpy(labels).float().to(device)
 
 #----------------------------------------------------------------------------
 
 def get_fake_labels(batch_size, device):
-    labels = np.random.uniform(0.0, 0.2, size=(batch_size,))   
+    labels = np.random.uniform(0.0, 0.1, size=(batch_size,))   
     return torch.from_numpy(labels).float().to(device)
 
 #----------------------------------------------------------------------------
@@ -141,12 +140,7 @@ class Train:
         # Specify GPUs
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Plot some training images
-        printer("Plotting training images") 
-
-        real_batch = next(iter(self.dataloader))
-        real_grid = vutils.make_grid(real_batch[0].to(self.device)[:64], padding=2, normalize=True)
-        real_grid = transforms.ToPILImage()(real_grid) 
+        
 
 
         #----------------------------------------------------------------------------
@@ -155,10 +149,6 @@ class Train:
 
         self.netG = Generator_(train.gen_input, train.gen_features, train.channels, train.resize[0]).to(self.device)
 
-        printer(f"Generator model saved to {os.path.join(train.savepath,'netG_architecture.pt')}")
-        #netG_script = torch.jit.script(netG) # Export to TorchScript
-        #netG_script.save(os.path.join(train.savepath,'netG_architecture.pt')) # Save
-
         # Handle multi-GPU if desired
         if (self.device.type == 'cuda') and (len(general.gpus) > 1):
             self.netG = nn.DataParallel(self.netG, list(int(d) for d in general.gpus))
@@ -166,14 +156,10 @@ class Train:
         # randomly initialize all weights to mean=0, stdev=0.02.
         printer("Initialising random weights for Generator model")
         self.netG.apply(weights_init)
-        print(self.netG)    
+        print(self.netG) 
      
         # Create the Discriminator
         self.netD = Discriminator(train.dis_features, train.channels, train.resize[0]).to(self.device)
-
-        printer(f"Discriminator model saved to {os.path.join(train.savepath,'netD_architecture.pt')}")
-        #netD_script = torch.jit.script(netD) # Export to TorchScript
-        #netD_script.save(os.path.join(train.savepath,'netD_architecture.pt')) # Save
 
         # Handle multi-GPU if desired
         if (self.device.type == 'cuda') and (len(general.gpus) > 1):
@@ -210,16 +196,19 @@ class Train:
         self.temperature = train.temperature
         self.total_steps = self.epochs * len(self.dataloader)
         self.temp_step = (self.temperature - self.min_temp) / (self.total_steps * 0.5)
+        self.fid_score = 9999
+        self.d_loss = 9999
+        self.g_loss = 9999
 
         self.experiment = experiment
         # Run with experiement if true
         if self.experiment:
             self.experiment.set_name(folder)
 
-            # Log implementation of model
-            self.experiment.log_code(file_name='./src/models/discriminator.py')
-            self.experiment.log_code(file_name='./src/models/generator.py')
-
+            # Log training images
+            real_batch = next(iter(self.dataloader))
+            real_grid = vutils.make_grid(real_batch[0].to(self.device)[:64], padding=2, normalize=True)
+            real_grid = transforms.ToPILImage()(real_grid) 
             self.experiment.log_image(real_grid, name="Real images")
 
             self.experiment.log_model('netG', os.path.join(train.savepath,'netG_architecture.pt'))
@@ -251,7 +240,7 @@ class Train:
 
 #----------------------------------------------------------------------------
 
-    def save_state(self, epoch): 
+    def save_state(self, epoch, filename="checkpoint"): 
         netG_state_dict, netD_state_dict  = self.get_state_dict()
 
         # Save current state for resumption        
@@ -262,7 +251,7 @@ class Train:
                 'state_dict': netG_state_dict,
                 'optimizer': self.optimizerG.state_dict(),
             }
-            with open(os.path.join(self.savepath, 'gen_checkpoint.t7'), 'wb') as f:
+            with open(os.path.join(self.savepath, 'gen_' + str(filename) + '.t7'), 'wb') as f:
                 torch.save([self.netG.kwargs, gen_state], f)
 
             dis_state = {
@@ -270,49 +259,46 @@ class Train:
                 'state_dict': netD_state_dict,
                 'optimizer': self.optimizerD.state_dict(),
             }
-            with open(os.path.join(self.savepath, 'dis_checkpoint.t7'), 'wb') as f:
+            with open(os.path.join(self.savepath, 'dis_' + str(filename) + '.t7'), 'wb') as f:
                 torch.save([self.netD.kwargs, dis_state], f)
         except Exception as e:
             printer(f"Error {str(e)}")
 
 #----------------------------------------------------------------------------
 
-    def epoch_eval(self, epoch):
-        # Generate fake image and save grid
-        with torch.no_grad():
-            fake = self.netG(self.fixed_noise).detach().cpu()
-            if self.experiment:
-                fake_grid = vutils.make_grid(fake, padding=2, normalize=True)
-                fake_grid = transforms.ToPILImage()(fake_grid)                
+    def epoch_eval(self, epoch, runtime):
+        if (epoch % 10) == 0:                
+            # Get and expand images
+            real1, _ = next(iter(self.dataloader))
+            real1 = torch.repeat_interleave(real1, 3, dim=1)
 
-        # Get and expand images
-        real, _ = next(iter(self.dataloader))
-        real = torch.repeat_interleave(real, 3, dim=1)
-        fake = torch.repeat_interleave(fake, 3, dim=1)
-        fake = fake[0:32]
-        
-        # Calculate FID64
-        fid = FrechetInceptionDistance(feature=64, normalize=True)
-        fid.update(real, real=True)
-        fid.update(fake, real=False)
-        fid_score64 = fid.compute()
+            real2, _ = next(iter(self.dataloader))
+            real2 = torch.repeat_interleave(real2, 3, dim=1)
 
-        # Calculate FID2048
-        fid = FrechetInceptionDistance(feature=2048, normalize=True)
-        fid.update(real, real=True)
-        fid.update(fake, real=False)
-        fid_score2048 = fid.compute()
+            real = torch.cat((real1, real2)) 
+            feature_num = max(real.shape[2], real.shape[3])
+            feature_num = 64
 
-        # Calculate KID
-        kid = KernelInceptionDistance(subset_size=32, normalize=True)
-        kid.update(real, real=True)
-        kid.update(fake, real=False)
-        kid_mean, kid_std = kid.compute()
+            # Generate fake image
+            with torch.no_grad():
+                fake_test = self.netG(self.fixed_noise).detach().cpu()
 
-        # Calculate inception score
-        inception = InceptionScore(normalize=True)
-        inception.update(fake)
-        inception_score = inception.compute()
+            fake_test = torch.repeat_interleave(fake_test, 3, dim=1)
+            fake_test = fake_test[0:real.shape[0]]
+
+            # https://pytorch.org/torcheval/main/generated/torcheval.metrics.FrechetInceptionDistance.html
+            # https://github.com/mseitzer/pytorch-fid
+            fid = FrechetInceptionDistance(feature=feature_num, normalize=True)
+            fid.update(real, real=True)
+            fid.update(fake_test, real=False)
+            fid_score2048 = fid.compute()
+
+            if fid_score2048 < self.fid_score:
+                netG_state_dict, netD_state_dict  = self.get_state_dict()
+                torch.save([self.netD.kwargs, netD_state_dict], os.path.join(self.savepath, 'lowest_fid_loss_D.pth'))
+                torch.save([self.netG.kwargs, netG_state_dict], os.path.join(self.savepath, 'lowest_fid_loss_G.pth'))
+
+                self.fid_score = fid_score2048
 
         epoch_G_losses = np.average(self.epoch_G_losses)
         epoch_D_losses = np.average(self.epoch_D_losses)
@@ -321,9 +307,26 @@ class Train:
         epoch_D_x = np.average(self.epoch_D_x)
         epoch_top_k = np.average(self.epoch_top_k)
 
-        if self.experiment:
-            self.experiment.log_image(fake_grid, name=f"Fake_Images")
+        if epoch_D_losses < self.d_loss:
+            netG_state_dict, netD_state_dict  = self.get_state_dict()
+            torch.save([self.netD.kwargs, netD_state_dict], os.path.join(self.savepath, 'lowest_d_loss_D.pth'))
+            torch.save([self.netG.kwargs, netG_state_dict], os.path.join(self.savepath, 'lowest_d_loss_G.pth'))
 
+            self.d_loss = epoch_D_losses
+
+        if epoch_G_losses < self.g_loss:
+            netG_state_dict, netD_state_dict  = self.get_state_dict()
+            torch.save([self.netD.kwargs, netD_state_dict], os.path.join(self.savepath, 'lowest_g_loss_D.pth'))
+            torch.save([self.netG.kwargs, netG_state_dict], os.path.join(self.savepath, 'lowest_g_loss_G.pth'))
+
+            self.g_loss = epoch_G_losses    
+
+        if (epoch % 20) == 0:
+            netG_state_dict, netD_state_dict  = self.get_state_dict()
+            torch.save([self.netD.kwargs, netD_state_dict], os.path.join(self.savepath, ('D_epcoh_' + str(epoch) +'.pth')))
+            torch.save([self.netG.kwargs, netG_state_dict], os.path.join(self.savepath, ('G_epcoh_' + str(epoch) +'.pth')))   
+
+        if self.experiment:
             epoch_logger = {
                 "Epoch_Gen_Loss": epoch_G_losses, 
                 "Epoch_Dis_Loss": epoch_D_losses,
@@ -331,24 +334,27 @@ class Train:
                 "Epoch_D_G_z2": epoch_D_G_z2,
                 "Epoch_D_x": epoch_D_x,
                 "Epoch_Top_K": epoch_top_k,
-                "FID_64": fid_score64,
-                "FID_2048": fid_score2048,
-                "Inception_0": inception_score[0],
-                "Inception_1": inception_score[1],
-                "KID_mean": kid_mean,
-                "KID_std": kid_std
+                "FID_2048": self.fid_score,
+                "Epoch_Runtime": runtime,
             }
             self.experiment.log_metrics(epoch_logger, epoch=epoch)
+
+            if (epoch % 10) == 0:
+                with torch.no_grad():
+                    fake_test = self.netG(self.fixed_noise).detach().cpu()
+                fake_grid = vutils.make_grid(fake_test, padding=2, normalize=True)
+                fake_grid = transforms.ToPILImage()(fake_grid)  
+                self.experiment.log_image(fake_grid, name=f"Fake_Images")   
 
         # Output training stats
         print_progress_bar(
                 len(self.dataloader), 
                 len(self.dataloader), 
                 prefix = f"Epoch {epoch+1} of {self.epochs}. Progress:", 
-                suffix = f"Complete. Loss_D: {epoch_D_losses:.4f}, Loss_G: {epoch_G_losses:.4f}, D(x): {epoch_D_x:.4f}, D(G(z)): {epoch_D_G_z1:.4f} / {epoch_D_G_z2:.4f}, FID_64: {fid_score64:.4f}, FID_2048: {fid_score2048:.4f}, Inception: {inception_score[0]:.4f}, {inception_score[1]:.4f}, KID mean / std: {kid_mean:.4f} / {kid_std:.4f}",
+                suffix = f"Complete. Loss_D: {epoch_D_losses:.4f}, Loss_G: {epoch_G_losses:.4f}, D(x): {epoch_D_x:.4f}, D(G(z)): {epoch_D_G_z1:.4f} / {epoch_D_G_z2:.4f}, FID_2048: {self.fid_score:.4f}",
                 decimals = 1,
                 length = 30,
-                end = "\r\n"
+                end = "\r\n\n"
         )
 
 #----------------------------------------------------------------------------
@@ -363,6 +369,8 @@ class Train:
         printer("Starting Training Loop...")
         # For each epoch
         for epoch in range(self.epochs):
+            # Epoch time
+            epoch_timer = time.time()
             # Store for plotting
             self.epoch_G_losses = []
             self.epoch_D_losses = []
@@ -378,7 +386,6 @@ class Train:
                 self.netG.zero_grad()
                 self.optimizerD.zero_grad()
                 self.optimizerG.zero_grad()
-
 
                 # Adjust the top elements to select
                 if epoch > self.warmup:                    
@@ -423,7 +430,7 @@ class Train:
                 # Update D
                 self.optimizerD.step()
                 #Compute error of D as sum over the fake and the real batches
-                loss_D = loss_D_real + loss_D_fake
+                loss_D = (loss_D_real + loss_D_fake)
 
                 self.epoch_D_losses.append(loss_D.item())
                 self.epoch_D_G_z1.append(D_G_z1)
@@ -457,8 +464,8 @@ class Train:
 
 
                 # Flare
-                #if temperature < 0.5 and random.uniform(0,1) > 0.9:
-                #    temperature += 0.3
+                if self.temperature < 0.5 and random.uniform(0,1) > 0.9:
+                    self.temperature += 0.3
 
                 print_progress_bar(
                     i+1, 
@@ -483,16 +490,15 @@ class Train:
 
                 step += 1
 
+            # Run time
+            elapsed_time = time.time() - epoch_timer
 
             #------------------------------------------------------------------------
             ## Log data (end of epoch)
-            #------------------------------------------------------------------------
+            #------------------------------------------------------------------------            
+            self.epoch_eval(epoch, elapsed_time)
 
-            self.epoch_eval(epoch)
-
-            # Save current state for resumption
-            if (epoch % 20) == 0:
-                self.save_state(epoch)
+            
 
         #----------------------------------------------------------------------------
         ## End of Training Loop

@@ -1,28 +1,30 @@
 {
 	"samples":
 	{
-		"model_path":			"./training/Wheat/netg_final.pth",
-		"destination":			"./results/wheat2/",
+		"model_path":			"H:/OneDrive - The University of Nottingham/Datasets/01.Stomata/Semantic/GibbsBean/40x/512_Stomata/Models/2024-04-24-17-08-29/G_epcoh_40.pth",
+		"destination":			"H:/OneDrive - The University of Nottingham/Datasets/01.Stomata/Semantic/GibbsBean/40x/128_Fake_Stomata/",
 		"channels":				1,
 		"gen_input":            128, 
 		"gen_features":         64,
 		"qty":					32,
-		"batches":				20,
+		"batches":				2,
 		"gpus":					"0"
 	},
 
 	"images":
 	{
-		"source":				"./results/wheat2/",
-		"destination":			"./results/wheat2/full",
-		"image_qty":			200,
-		"min_samples":			20,
-		"max_samples":			25,
+		"source":				"H:/OneDrive - The University of Nottingham/Datasets/01.Stomata/Semantic/GibbsBean/40x/128_Fake_Stomata/Fake/",
+		"destination":			"H:/OneDrive - The University of Nottingham/Datasets/01.Stomata/Semantic/GibbsBean/40x/Fake_Images_10x/",
+		"background_source":	"H:/OneDrive - The University of Nottingham/Datasets/01.Stomata/Semantic/GibbsBean/40x/64_Background/Training_Images/background/",
+		"image_qty":			500,
+		"min_samples":			5,
+		"max_samples":			10,
 		"size":					512,
 		"noise":				0,
-		"boundary":				10,
-		"min_scale":			0.2,
-		"max_scale":			0.5,
-		"draw_contours":		0					
+		"boundary":				20,
+		"min_scale":			0.6,
+		"max_scale":			0.7,
+		"draw_contours":		0,
+		"test_split":			0.2					
 	}
 }

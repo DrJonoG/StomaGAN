@@ -18,7 +18,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import torchvision.utils as vutils
 
-from random import randrange, uniform, sample, randint
+from random import randrange, uniform, sample, randint, choice
 from scipy import ndimage
 from utils.helpers import printer, dotdict
 from utils.image_helpers import resize, rotate
@@ -139,23 +139,68 @@ def random_coordinates(
 
 #----------------------------------------------------------------------------
 
+def blur (
+    image: np.ndarray,
+    blur_type: str = "mean",
+    fsize: int = 9
+) -> np.ndarray:
+    fsize = choice([3,5,9])
+    if blur_type == "mean":
+        return cv2.blur(image,(fsize,fsize))
+    elif blur_type == "gaussian":
+        return cv2.GaussianBlur(image, (fsize, fsize), 0)
+    elif blur_type == "median":
+        return cv2.medianBlur(image, fsize)
+    else:
+        return image
+
+#----------------------------------------------------------------------------
+
+def sharpen (
+    image: np.ndarray
+) -> np.ndarray:
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]]) 
+    return cv2.filter2D(image, -1, kernel) 
+
+#----------------------------------------------------------------------------
+
+def adjust_gamma(image, gamma=1.0):
+
+   invGamma = 1.0 / gamma
+   table = np.array([((i / 255.0) ** invGamma) * 255
+      for i in np.arange(0, 256)]).astype("uint8")
+
+   return cv2.LUT(image, table)
+
+#----------------------------------------------------------------------------    
+
 def generate_whole(
     config: object,
 ) -> None:
     file_list = []
+    background_list = []
     image_extensions = {".jpg",".jpeg",".png",".tif"}
+
+
 
     # Get list of all samples
     for filename in os.listdir(config.source):
         if any(filename.lower().endswith(ext) for ext in image_extensions): # Verify the file is an image
             file_list.append(os.path.join(config.source, filename))
 
+    # Get list of all samples
+    if config.background_source:
+        for filename in os.listdir(config.background_source):
+            if any(filename.lower().endswith(ext) for ext in image_extensions): # Verify the file is an image
+                background_list.append(os.path.join(config.background_source, filename))
+
+    train_images = int((1 - config.test_split) * config.image_qty)
+    test_images = int(config.image_qty - train_images)
+
     # Create images
     for i in range(0, config.image_qty):
-        filename = os.path.join(config.destination, str(int(time.time()*1000.0)))
-
         # Empty images
-        img = np.full((config.size,config.size), 255)
+        img = np.full((config.size,config.size, 3), 255)
         img_mask = np.full((config.size,config.size), 255)
 
         # To store existing coordinates to prevent overlapping
@@ -165,6 +210,33 @@ def generate_whole(
         samples = randint(config.min_samples,config.max_samples)
         image_samples = sample(file_list, samples)
 
+
+        printer(f"Generating image {i} of {config.img_qty} processing sample {samples} of {samples}.. Complete.. Performing post processing...", end="\r")
+
+        # Image creation
+        if len(background_list) > 0:
+
+            image_temp = background_list[randint(0, len(background_list)-1)]
+            image_temp = cv2.imread(image_temp, cv2.COLOR_BGR2GRAY)
+
+            j = int(config.size / image_temp.shape[0])
+            k = int(config.size / image_temp.shape[1])
+
+            for img_j in range(0, j):
+                for img_k in range(0, k):
+                    random_image = background_list[randint(0, len(background_list)-1)]
+                    random_image = cv2.imread(random_image, cv2.COLOR_BGR2GRAY)
+
+                    img[int(img_j * image_temp.shape[0]):int((img_j + 1) * image_temp.shape[0]), int(img_k * image_temp.shape[1]):int((img_k + 1) * image_temp.shape[1])] = random_image
+        elif config.noise:
+            img_h,img_w = img.shape[:2]
+            noise = np.random.randint(50, 205, (img_w, img_h))
+            img = np.where(img > 250, noise, img)
+
+        img = img.astype(np.uint8)
+        #img = resize(img, config.size)
+
+
         printer(f"Generating image {i+1} of {config.img_qty} processing {samples} samples", end="\r")
         for count, sample_img in enumerate(image_samples):
             sample_img = cv2.imread(sample_img, cv2.COLOR_BGR2GRAY)
@@ -172,7 +244,19 @@ def generate_whole(
             # Sample augmentations            
             scaling_factor = round(uniform(config.min_scale, config.max_scale), 2)            
             sample_img = cv2.resize(sample_img, None, fx=scaling_factor, fy=scaling_factor, interpolation=cv2.INTER_AREA)
-            sample_img = rotate(sample_img, round(uniform(-30, 30), 1))
+            sample_img = rotate(sample_img, randint(0, 359))
+    
+            if randint(0, 10) == 1:
+                k = choice([3, 5])
+                k = 3
+                sample_img = cv2.blur(sample_img, (k,k))
+            elif randint(0, 10) == 1:
+                k = choice([3, 5])
+                k = 3
+                sample_img = cv2.GaussianBlur(sample_img, (k, k), 0)
+            
+            if randint(0, 8) == 1:
+                sample_img = adjust_gamma(sample_img, uniform(0.5, 0.9)) 
 
             h, w = sample_img.shape[:2]
 
@@ -181,23 +265,14 @@ def generate_whole(
             coordinates.append((x, y, w, h))
 
             # Place sample on image
-            img[y:y+h, x:x+w] = sample_img
+            for x_count, x_iter in enumerate(range(x, x+w)):
+                for y_count, y_iter in enumerate(range(y, y+h)):
+                    if sample_img[y_count, x_count] > 245: continue                    
+                    img[y_iter, x_iter] = sample_img[y_count, x_count]
             img_mask[y:y+h, x:x+w] = sample_img
 
-        printer(f"Generating image {i} of {config.img_qty} processing sample {samples} of {samples}.. Complete.. Performing post processing...", end="\r")
-
-        # Image creation
-        if config.noise:
-            noise = np.random.randint(50, 205, (img_w, img_h))
-            img = np.where(img > 250, noise, img)
-
-        img = img.astype(np.uint8)
-        img = resize(img, config.size)
-
-        cv2.imwrite(filename + ".jpg", img)
-
         # Mask creation
-        img_mask = np.where(img_mask < 220, 255, 0)
+        img_mask = np.where(img_mask < 220, 120, 0)
 
         # Close holes in mask
         kernel = np.ones((9,9), np.uint8)
@@ -207,7 +282,41 @@ def generate_whole(
         img_mask = np.invert(img_mask)
         img_mask = resize(img_mask, config.size)
 
-        cv2.imwrite(filename + "_mask.jpg", img_mask)
+        # Soft smoothing
+        if randint(0, 30) == 1:
+            img = cv2.blur(img, (3,3))
+
+        if randint(0, 15) == 1:
+            img = adjust_gamma(img, uniform(0.7, 0.9)) 
+
+        # Apply clahe
+        h,w = img.shape[:2]
+        img = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+        grid = max((min((int(w*0.01),int(h*0.01))), 8))
+        clahe = cv2.createCLAHE(clipLimit=10, tileGridSize= (grid,grid))
+
+        img = clahe.apply(img)
+
+        # Mask creation
+        img_mask = np.where(img_mask > 200, 255, 120)
+  
+        if i < test_images:     
+            file = str(int(time.time()*1000.0))
+
+            valid_mask_path = os.path.join(config.destination, "valid_mask", file)
+            valid_samples_path = os.path.join(config.destination, "valid_samples", file) 
+
+            cv2.imwrite(valid_samples_path + ".jpg", img)
+            cv2.imwrite(valid_mask_path + "_mask.jpg", img_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+        else:
+            file = str(int(time.time()*1000.0))
+
+            train_mask_path = os.path.join(config.destination, "train_mask", file)
+            train_samples_path = os.path.join(config.destination, "train_samples", file) 
+
+            cv2.imwrite(train_samples_path + ".jpg", img)
+            cv2.imwrite(train_mask_path + "_mask.jpg", img_mask, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+
 
 #----------------------------------------------------------------------------
 
@@ -329,6 +438,19 @@ if __name__ == '__main__':
 
         if parser_error:
             exit(0)
+
+        # Create folders for data split
+        if not os.path.exists(os.path.join(config.destination, "valid_mask")):
+            os.mkdir(os.path.join(config.destination, "valid_mask"))
+
+        if not os.path.exists(os.path.join(config.destination, "valid_samples")):
+            os.mkdir(os.path.join(config.destination, "valid_samples"))
+
+        if not os.path.exists(os.path.join(config.destination, "train_mask")):
+            os.mkdir(os.path.join(config.destination, "train_mask"))
+
+        if not os.path.exists(os.path.join(config.destination, "train_samples")):
+            os.mkdir(os.path.join(config.destination, "train_samples"))
 
         generate_whole(config)
    

@@ -169,3 +169,6 @@ results/*
 data/*
 data_wheat
 paper
+results
+docs
+training
